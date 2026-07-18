@@ -13,27 +13,36 @@
 #
 # The training Python file does NOT need to be uploaded separately.
 #
-# Required external asset:
-#   A dataset containing either:
-#     <DATASET_SOURCE>/images + <DATASET_SOURCE>/sparse/0
-#   or:
-#     <DATASET_SOURCE>/train/images + <DATASET_SOURCE>/train/sparse/0
+# Expected project layout (automatically detected):
 #
-# Examples:
+#   ~/ai-tuyen/
+#   ├── bts_ai_race/
+#   │   └── setup_and_train_3dgrut.sh
+#   └── dataset/
+#       └── phase1/
+#           └── public_set/
+#               └── HCM0181/
+#                   ├── train/
+#                   │   ├── images/
+#                   │   └── sparse/0/
+#                   └── test/
 #
-#   DATASET_SOURCE=/data/AI_Race/HCM0181 bash setup_and_train_3dgrut.sh
+# Default run:
 #
-#   GPU_ID=0 \
-#   DATASET_SOURCE=/data/AI_Race/HCM0181 \
-#   WORK_ROOT=$HOME/ai_race_2026 \
+#   cd ~/ai-tuyen/bts_ai_race
 #   bash setup_and_train_3dgrut.sh
+#
+# Select another scene:
+#
+#   bash setup_and_train_3dgrut.sh HCM0204
 #
 # RTX 4060 8 GB safer override:
 #
-#   DATASET_SOURCE=/data/AI_Race/HCM0181 \
 #   CAP_MAX=1500000 \
 #   NHT_FEATURE_DIM=32 \
-#   bash setup_and_train_3dgrut.sh
+#   bash setup_and_train_3dgrut.sh HCM0181
+#
+# DATASET_SOURCE can still be supplied explicitly for a custom location.
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -54,10 +63,20 @@ trap on_error ERR
 # Override any value by exporting it before running this script.
 # =============================================================================
 
-SCENE_NAME="${SCENE_NAME:-HCM0181}"
+# Resolve paths from this shell file, not from the current working directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+AI_TUYEN_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+
+# The first positional argument may select another scene:
+#   bash setup_and_train_3dgrut.sh HCM0204
+SCENE_NAME="${1:-${SCENE_NAME:-HCM0181}}"
+
+# Default dataset location for the current project layout.
+PUBLIC_SET_ROOT="${PUBLIC_SET_ROOT:-$AI_TUYEN_ROOT/dataset/phase1/public_set}"
 DATASET_SOURCE="${DATASET_SOURCE:-}"
 
-WORK_ROOT="${WORK_ROOT:-$HOME/ai_race_2026}"
+# Keep the large cloned repository, .venv and run outputs outside bts_ai_race.
+WORK_ROOT="${WORK_ROOT:-$AI_TUYEN_ROOT/3dgrut_workspace}"
 REPO_DIR="${REPO_DIR:-$WORK_ROOT/3dgrut}"
 REPO_URL="${REPO_URL:-https://github.com/nv-tlabs/3dgrut.git}"
 REPO_COMMIT="${REPO_COMMIT:-a37ef721012dea0f29c0fcfff2d525023b4e854a}"
@@ -110,6 +129,9 @@ echo "============================================================"
 echo "3DGRUT ONE-FILE SETUP + TRAIN"
 echo "============================================================"
 echo "Date             : $(date --iso-8601=seconds)"
+echo "Script directory : $SCRIPT_DIR"
+echo "AI Tuyen root    : $AI_TUYEN_ROOT"
+echo "Public set root  : $PUBLIC_SET_ROOT"
 echo "Scene            : $SCENE_NAME"
 echo "Work root        : $WORK_ROOT"
 echo "Repository       : $REPO_DIR"
@@ -285,15 +307,50 @@ PYVERIFY
 }
 
 auto_find_dataset() {
-    [[ -n "$DATASET_SOURCE" ]] && return 0
+    # Respect an explicitly supplied valid path.
+    if [[ -n "$DATASET_SOURCE" && -d "$DATASET_SOURCE" ]]; then
+        return 0
+    fi
 
-    local candidate
+    local candidate=""
+    local root=""
+
+    # Search the project's public dataset first. Scene matching is
+    # case-insensitive because some folders are lowercase (for example hcm0031).
+    for root in \
+        "$PUBLIC_SET_ROOT" \
+        "$AI_TUYEN_ROOT/dataset/phase1/private_set1" \
+        "$AI_TUYEN_ROOT/dataset/phase1" \
+        "$WORK_ROOT/data" \
+        "$WORK_ROOT/datasets"
+    do
+        [[ -d "$root" ]] || continue
+
+        if [[ -d "$root/$SCENE_NAME" ]]; then
+            DATASET_SOURCE="$root/$SCENE_NAME"
+            return 0
+        fi
+
+        candidate="$(
+            find "$root" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -iname "$SCENE_NAME" \
+                -print \
+                -quit 2>/dev/null || true
+        )"
+        if [[ -n "$candidate" ]]; then
+            DATASET_SOURCE="$candidate"
+            return 0
+        fi
+    done
+
+    # Compatibility with the older directory layout.
     for candidate in \
-        "$PWD/data/$SCENE_NAME" \
-        "$WORK_ROOT/data/$SCENE_NAME" \
-        "$WORK_ROOT/datasets/$SCENE_NAME" \
-        "$HOME/ai_race_2026/data/$SCENE_NAME" \
-        "$REPO_DIR/data/$SCENE_NAME"
+        "$SCRIPT_DIR/data/$SCENE_NAME" \
+        "$REPO_DIR/data/$SCENE_NAME" \
+        "$HOME/ai_race_2026/data/$SCENE_NAME"
     do
         if [[ -d "$candidate" ]]; then
             DATASET_SOURCE="$candidate"
@@ -305,7 +362,7 @@ auto_find_dataset() {
 prepare_dataset_link() {
     auto_find_dataset
     [[ -n "$DATASET_SOURCE" ]] || die \
-        "DATASET_SOURCE is not set and no dataset was auto-detected."
+        "Could not auto-detect scene '$SCENE_NAME'. Expected: $PUBLIC_SET_ROOT/$SCENE_NAME. Set DATASET_SOURCE explicitly for another location."
 
     DATASET_SOURCE="$(readlink -f "$DATASET_SOURCE")"
     [[ -d "$DATASET_SOURCE" ]] || die "Dataset directory does not exist: $DATASET_SOURCE"
@@ -355,6 +412,8 @@ prepare_dataset_link() {
         ln -s "$ready_root" "$target"
     fi
 
+    echo "[Data] Scene           : $SCENE_NAME"
+    echo "[Data] Public set root : $PUBLIC_SET_ROOT"
     echo "[Data] Source          : $DATASET_SOURCE"
     echo "[Data] Training root   : $ready_root"
     echo "[Data] Repository link : $target -> $(readlink -f "$target")"
