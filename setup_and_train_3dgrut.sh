@@ -9,7 +9,8 @@
 #   4. Runs NVIDIA's official UV environment installer.
 #   5. Links a COLMAP dataset into the repository.
 #   6. Generates the complete Python training launcher embedded below.
-#   7. Starts 3DGUT + MCMC + NHT training.
+#   7. Starts 3DGUT + MCMC + NHT training with live progress.
+#   8. Saves on Ctrl+C and auto-resumes on the next run.
 #
 # The training Python file does NOT need to be uploaded separately.
 #
@@ -58,6 +59,16 @@ on_error() {
 }
 trap on_error ERR
 
+on_interrupt() {
+    echo
+    echo "============================================================" >&2
+    echo "INTERRUPT REQUESTED" >&2
+    echo "The patched trainer will save ckpt_last.pt before exiting." >&2
+    echo "Run this same command again; AUTO_RESUME=true will continue it." >&2
+    echo "============================================================" >&2
+}
+trap on_interrupt INT
+
 # =============================================================================
 # USER CONFIGURATION
 # Override any value by exporting it before running this script.
@@ -103,6 +114,19 @@ FORCE_REBUILD_PHOTOMETRIC="${FORCE_REBUILD_PHOTOMETRIC:-false}"
 OVERWRITE_EXPERIMENT="${OVERWRITE_EXPERIMENT:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 
+# Resume the newest checkpoint found under the same experiment name.
+AUTO_RESUME="${AUTO_RESUME:-true}"
+
+# Patch train.py so Ctrl+C first writes ckpt_last.pt, then exits.
+SAVE_ON_INTERRUPT="${SAVE_ON_INTERRUPT:-true}"
+
+# Keep Rich's live progress bar while also recording a terminal log.
+USE_PTY_LOGGING="${USE_PTY_LOGGING:-true}"
+
+# tiny-cuda-nn JIT currently fails on this server's runtime include discovery.
+# 0 avoids the warning and uses the stable non-JIT path. Set 1 to retry JIT.
+TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
+
 RUN_NAME="${RUN_NAME:-}"
 OUT_ROOT="${OUT_ROOT:-$REPO_DIR/runs}"
 
@@ -139,8 +163,25 @@ export PYTORCH_ALLOC_CONF
 
 mkdir -p "$WORK_ROOT/logs"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="$WORK_ROOT/logs/3dgrut_${SCENE_NAME}_${TIMESTAMP}.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+LOG_FILE="${LOG_FILE:-$WORK_ROOT/logs/3dgrut_${SCENE_NAME}_${TIMESTAMP}.log}"
+
+# Rich progress bars require a TTY. Re-run this same script once inside
+# util-linux `script`, which provides a pseudo-terminal and records the output.
+if [[ "$USE_PTY_LOGGING" == "true" \
+   && -z "${_3DGRUT_PTY_ACTIVE:-}" \
+   && -t 1 \
+   && -x "$(command -v script 2>/dev/null || true)" ]]; then
+    export _3DGRUT_PTY_ACTIVE=1
+    export LOG_FILE
+    printf -v _3DGRUT_REEXEC_COMMAND '%q ' bash "$0" "$@"
+    exec script -q -f -e -c "$_3DGRUT_REEXEC_COMMAND" "$LOG_FILE"
+fi
+
+# Non-interactive fallback (nohup, CI, redirected output). This records logs,
+# but a live Rich progress bar cannot be rendered without a terminal.
+if [[ -z "${_3DGRUT_PTY_ACTIVE:-}" ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 echo "============================================================"
 echo "3DGRUT ONE-FILE SETUP + TRAIN"
@@ -156,6 +197,10 @@ echo "Pinned commit    : $REPO_COMMIT"
 echo "Physical GPU ID  : $GPU_ID"
 echo "CUDA visible     : $CUDA_VISIBLE_DEVICES"
 echo "Min free VRAM    : ${MIN_FREE_GPU_MEMORY_MIB} MiB"
+echo "Auto resume      : $AUTO_RESUME"
+echo "Save on Ctrl+C   : $SAVE_ON_INTERRUPT"
+echo "PTY progress     : $USE_PTY_LOGGING"
+echo "TCNN JIT fusion  : $TCNN_JIT_FUSION"
 echo "Log              : $LOG_FILE"
 echo "============================================================"
 
@@ -293,11 +338,13 @@ detect_cuda() {
     fi
 
     if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
-        :
+        CUDA_HOME="$(readlink -f "$CUDA_HOME")"
     elif have_command nvcc; then
-        CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+        local nvcc_real
+        nvcc_real="$(readlink -f "$(command -v nvcc)")"
+        CUDA_HOME="$(dirname "$(dirname "$nvcc_real")")"
     elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
-        CUDA_HOME="/usr/local/cuda"
+        CUDA_HOME="$(readlink -f /usr/local/cuda)"
     else
         local candidate=""
         for candidate in /usr/local/cuda-*; do
@@ -314,7 +361,35 @@ detect_cuda() {
     export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
     export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
+    local cuda_include_dir=""
+    local include_candidate=""
+    for include_candidate in \
+        "$CUDA_HOME/include" \
+        "$CUDA_HOME/targets/x86_64-linux/include" \
+        "$CUDA_HOME/targets/$(uname -m)-linux/include" \
+        "/usr/local/cuda/include" \
+        "/usr/include"
+    do
+        if [[ -f "$include_candidate/vector_types.h" ]]; then
+            cuda_include_dir="$include_candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$cuda_include_dir" ]]; then
+        export CUDA_INCLUDE_DIR="$cuda_include_dir"
+        export CPATH="$cuda_include_dir${CPATH:+:$CPATH}"
+        export C_INCLUDE_PATH="$cuda_include_dir${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+        export CPLUS_INCLUDE_PATH="$cuda_include_dir${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+        echo "[CUDA] Runtime include=$cuda_include_dir"
+        echo "[CUDA] vector_types.h found"
+    else
+        echo "WARNING: vector_types.h was not found under CUDA_HOME or standard include paths."
+        echo "WARNING: TCNN JIT will remain disabled unless TCNN_JIT_FUSION=1 is requested."
+    fi
+
     echo "[CUDA] CUDA_HOME=$CUDA_HOME"
+    echo "[CUDA] nvcc real path=$(readlink -f "$CUDA_HOME/bin/nvcc")"
     "$CUDA_HOME/bin/nvcc" --version
 }
 
@@ -652,12 +727,17 @@ RUN_NAME = os.environ.get(
 OUT_ROOT = Path(os.environ.get("OUT_ROOT", str(SCRIPT_ROOT / "runs"))).expanduser().resolve()
 OVERWRITE_EXPERIMENT = os.environ.get("OVERWRITE_EXPERIMENT", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+AUTO_RESUME = os.environ.get("AUTO_RESUME", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+SAVE_ON_INTERRUPT = os.environ.get("SAVE_ON_INTERRUPT", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+TCNN_JIT_FUSION = os.environ.get("TCNN_JIT_FUSION", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # Tested against this public main commit. The script checks source anchors before patching.
 EXPECTED_3DGRUT_COMMIT = "a37ef721012dea0f29c0fcfff2d525023b4e854a"
 DATASET_PATCH_MARKER = "# BEGIN dataset MISSING RGB FILTER PATCH"
 DATASET_NO_SPLIT_MARKER = "# BEGIN dataset NO-SPLIT INDEX PATCH"
 HORIZON_PATCH_MARKER = "# BEGIN dataset HORIZON LOSS PATCH"
+INTERRUPT_PATCH_MARKER = "# BEGIN SAVE CHECKPOINT ON INTERRUPT PATCH"
+TCNN_JIT_PATCH_MARKER = "# BEGIN TCNN JIT CONTROL PATCH"
 
 
 # =============================================================================
@@ -1411,6 +1491,92 @@ def _horizon_sobel_magnitude(rgb: torch.Tensor) -> torch.Tensor:
     print(f"[Patch] Updated: {path}")
 
 
+
+def patch_save_checkpoint_on_interrupt(path: Path) -> None:
+    """Make Ctrl+C save ckpt_last.pt and return a non-zero exit code."""
+    text = path.read_text(encoding="utf-8")
+    if INTERRUPT_PATCH_MARKER in text:
+        print("[Patch] Save-on-interrupt support is already present.")
+        return
+
+    anchor = """    trainer = Trainer3DGRUT(conf)
+    try:
+        trainer.run_training()
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user.")
+"""
+    replacement = """    trainer = Trainer3DGRUT(conf)
+    try:
+        trainer.run_training()
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user.")
+        # BEGIN SAVE CHECKPOINT ON INTERRUPT PATCH
+        try:
+            trainer.save_checkpoint(last_checkpoint=True)
+            logger.warning(
+                f"Interrupt checkpoint saved at global step {trainer.global_step}. "
+                "Run the launcher again to resume automatically."
+            )
+        except Exception as checkpoint_error:
+            logger.error(
+                f"Could not save interrupt checkpoint: {checkpoint_error}"
+            )
+        raise
+        # END SAVE CHECKPOINT ON INTERRUPT PATCH
+"""
+    text = replace_once(
+        text,
+        anchor,
+        replacement,
+        "save checkpoint on KeyboardInterrupt",
+    )
+    backup_once(path, ".pre_interrupt_checkpoint.bak")
+    path.write_text(text, encoding="utf-8")
+    py_compile.compile(str(path), doraise=True)
+    print(f"[Patch] Ctrl+C checkpoint saving enabled: {path}")
+
+
+def patch_tcnn_jit_control(path: Path) -> None:
+    """Allow TCNN_JIT_FUSION=0 to skip a known-failing RTC JIT attempt."""
+    text = path.read_text(encoding="utf-8")
+    if TCNN_JIT_PATCH_MARKER in text:
+        print("[Patch] tiny-cuda-nn JIT control is already present.")
+        return
+
+    text = replace_once(
+        text,
+        "import tinycudann as tcnn\nimport torch\n",
+        "import os\n\nimport tinycudann as tcnn\nimport torch\n",
+        "feature decoder os import",
+    )
+
+    anchor = """        if hasattr(tcnn, "supports_jit_fusion"):
+            self.network.jit_fusion = tcnn.supports_jit_fusion()
+"""
+    replacement = """        # BEGIN TCNN JIT CONTROL PATCH
+        if hasattr(tcnn, "supports_jit_fusion"):
+            raw_jit = os.environ.get("TCNN_JIT_FUSION", "0").strip().lower()
+            requested_jit = raw_jit in {"1", "true", "yes", "y", "on"}
+            self.network.jit_fusion = bool(
+                requested_jit and tcnn.supports_jit_fusion()
+            )
+        # END TCNN JIT CONTROL PATCH
+"""
+    text = replace_once(
+        text,
+        anchor,
+        replacement,
+        "tiny-cuda-nn JIT environment control",
+    )
+    backup_once(path, ".pre_tcnn_jit_control.bak")
+    path.write_text(text, encoding="utf-8")
+    py_compile.compile(str(path), doraise=True)
+    print(
+        f"[Patch] tiny-cuda-nn JIT controlled by TCNN_JIT_FUSION="
+        f"{int(TCNN_JIT_FUSION)}: {path}"
+    )
+
+
 # =============================================================================
 # LAUNCH
 # =============================================================================
@@ -1429,8 +1595,18 @@ def git_revision(root: Path) -> str:
 
 
 def newest_checkpoint(experiment_dir: Path) -> Path | None:
-    candidates = list(experiment_dir.glob("*/ckpt_last.pt"))
-    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+    if not experiment_dir.is_dir():
+        return None
+
+    candidates = {
+        *experiment_dir.rglob("ckpt_last.pt"),
+        *experiment_dir.rglob("ckpt_*.pt"),
+    }
+    candidates = {
+        path for path in candidates
+        if path.is_file() and path.stat().st_size > 0
+    }
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
 def main() -> None:
@@ -1446,6 +1622,7 @@ def main() -> None:
     root = locate_3dgrut_root()
     dataset_file = root / "threedgrut" / "datasets" / "dataset_colmap.py"
     trainer_file = root / "threedgrut" / "trainer.py"
+    feature_decoder_file = root / "threedgrut" / "model" / "feature_decoder.py"
     train_entry = root / "train.py"
 
     required = [
@@ -1477,15 +1654,30 @@ def main() -> None:
 
     patch_colmap_missing_rgb_filter(dataset_file)
     patch_horizon_aware_loss(trainer_file)
+    patch_tcnn_jit_control(feature_decoder_file)
+    if SAVE_ON_INTERRUPT:
+        patch_save_checkpoint_on_interrupt(train_entry)
 
     experiment_dir = OUT_ROOT / RUN_NAME
-    if experiment_dir.exists() and newest_checkpoint(experiment_dir) is not None:
-        if not OVERWRITE_EXPERIMENT:
-            fail(
-                f"A completed run already exists under: {experiment_dir}\n"
-                "Change RUN_NAME or set OVERWRITE_EXPERIMENT=True."
+    resume_checkpoint = newest_checkpoint(experiment_dir)
+
+    if resume_checkpoint is not None:
+        if OVERWRITE_EXPERIMENT:
+            print(
+                f"[Resume] OVERWRITE_EXPERIMENT=True; deleting old run: "
+                f"{experiment_dir}"
             )
-        shutil.rmtree(experiment_dir)
+            shutil.rmtree(experiment_dir)
+            resume_checkpoint = None
+        elif AUTO_RESUME:
+            print(f"[Resume] Found checkpoint: {resume_checkpoint}")
+            print("[Resume] Training will continue from its stored global_step.")
+        else:
+            fail(
+                f"A checkpoint already exists under: {experiment_dir}\n"
+                "Set AUTO_RESUME=true to continue, OVERWRITE_EXPERIMENT=true "
+                "to restart, or change RUN_NAME."
+            )
 
     command = [
         sys.executable,
@@ -1546,6 +1738,9 @@ def main() -> None:
             f"post_processing.n_distillation_steps={PPISP_DISTILLATION_STEPS}",
         ])
 
+    if resume_checkpoint is not None:
+        command.append(f"resume={resume_checkpoint.resolve()}")
+
     print("\n========== 3DGRUT TRAIN CONFIG ==========")
     print(f"Mode                  : {APPEARANCE_MODE}")
     print(f"Dataset               : {train_scene}")
@@ -1561,6 +1756,9 @@ def main() -> None:
     print(f"NHT feature dim       : {NHT_FEATURE_DIM}")
     print(f"PPISP                 : {pp_method}")
     print(f"Horizon report        : {horizon_report}")
+    print(f"TCNN JIT fusion       : {TCNN_JIT_FUSION}")
+    print(f"Auto resume           : {AUTO_RESUME}")
+    print(f"Resume checkpoint     : {resume_checkpoint or 'none'}")
     print(f"Output experiment     : {experiment_dir}")
     print("\nCommand:")
     print(" \\\n  ".join(command))
@@ -1572,6 +1770,7 @@ def main() -> None:
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
     environment["PYTHONUNBUFFERED"] = "1"
+    environment["TCNN_JIT_FUSION"] = "1" if TCNN_JIT_FUSION else "0"
     environment.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     subprocess.run(command, cwd=str(root), env=environment, check=True)
 
@@ -1594,6 +1793,8 @@ def main() -> None:
         "color_refine_steps": COLOR_REFINE_STEPS,
         "cap_max": CAP_MAX,
         "nht_feature_dim": NHT_FEATURE_DIM,
+        "resumed_from": str(resume_checkpoint.resolve()) if resume_checkpoint else None,
+        "tcnn_jit_fusion": TCNN_JIT_FUSION,
     }
     manifest_path = experiment_dir / "latest_run.json"
     manifest_path.write_text(
@@ -1634,6 +1835,9 @@ run_training() {
     export FORCE_REBUILD_PHOTOMETRIC
     export OVERWRITE_EXPERIMENT
     export DRY_RUN
+    export AUTO_RESUME
+    export SAVE_ON_INTERRUPT
+    export TCNN_JIT_FUSION
     export OUT_ROOT
     export PYTORCH_ALLOC_CONF
     export CUDA_DEVICE_ORDER
@@ -1663,6 +1867,9 @@ run_training() {
     echo "Save steps           : $SAVE_STEPS"
     echo "Gaussian cap         : $CAP_MAX"
     echo "NHT feature dim      : $NHT_FEATURE_DIM"
+    echo "Auto resume          : $AUTO_RESUME"
+    echo "Save on Ctrl+C       : $SAVE_ON_INTERRUPT"
+    echo "TCNN JIT fusion      : $TCNN_JIT_FUSION"
     echo "Output root          : $OUT_ROOT"
     echo "============================================================"
     echo
