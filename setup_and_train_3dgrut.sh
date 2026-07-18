@@ -30,17 +30,17 @@
 # Default run:
 #
 #   cd ~/ai-tuyen/bts_ai_race
-#   bash setup_and_train_3dgrut.sh
+#   GPU_ID=1 bash setup_and_train_3dgrut.sh
 #
 # Select another scene:
 #
-#   bash setup_and_train_3dgrut.sh HCM0204
+#   GPU_ID=1 bash setup_and_train_3dgrut.sh HCM0204
 #
 # RTX 4060 8 GB safer override:
 #
 #   CAP_MAX=1500000 \
 #   NHT_FEATURE_DIM=32 \
-#   bash setup_and_train_3dgrut.sh HCM0181
+#   GPU_ID=1 bash setup_and_train_3dgrut.sh HCM0181
 #
 # DATASET_SOURCE can still be supplied explicitly for a custom location.
 #
@@ -81,7 +81,9 @@ REPO_DIR="${REPO_DIR:-$WORK_ROOT/3dgrut}"
 REPO_URL="${REPO_URL:-https://github.com/nv-tlabs/3dgrut.git}"
 REPO_COMMIT="${REPO_COMMIT:-a37ef721012dea0f29c0fcfff2d525023b4e854a}"
 
-GPU_ID="${GPU_ID:-0}"
+# Physical NVIDIA GPU index. This server should train on GPU 1 by default.
+# Override when needed, for example: GPU_ID=0 bash setup_and_train_3dgrut.sh
+GPU_ID="${GPU_ID:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
 APPEARANCE_MODE="${APPEARANCE_MODE:-native_distortion}"
@@ -113,8 +115,23 @@ FORCE_ENV_SETUP="${FORCE_ENV_SETUP:-0}"
 # Limit parallel native compilation to avoid host RAM exhaustion.
 MAX_JOBS="${MAX_JOBS:-8}"
 
+# Warn before training when the selected physical GPU has less free VRAM.
+# For the default 2M Gaussian + NHT feature-dim 48 configuration, 30 GiB is a
+# conservative preflight threshold on this 46 GiB L40S server.
+MIN_FREE_GPU_MEMORY_MIB="${MIN_FREE_GPU_MEMORY_MIB:-30000}"
+
+# Set STRICT_GPU_MEMORY_CHECK=1 to stop instead of only warning.
+STRICT_GPU_MEMORY_CHECK="${STRICT_GPU_MEMORY_CHECK:-0}"
+
 # Modern PyTorch allocator variable.
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+
+# Apply physical-GPU selection before environment validation and training.
+# Inside PyTorch this selected physical GPU becomes logical cuda:0.
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+export CUDA_VISIBLE_DEVICES="$GPU_ID"
+export PHYSICAL_GPU_ID="$GPU_ID"
+export PYTORCH_ALLOC_CONF
 
 # =============================================================================
 # LOGGING
@@ -136,7 +153,9 @@ echo "Scene            : $SCENE_NAME"
 echo "Work root        : $WORK_ROOT"
 echo "Repository       : $REPO_DIR"
 echo "Pinned commit    : $REPO_COMMIT"
-echo "GPU ID           : $GPU_ID"
+echo "Physical GPU ID  : $GPU_ID"
+echo "CUDA visible     : $CUDA_VISIBLE_DEVICES"
+echo "Min free VRAM    : ${MIN_FREE_GPU_MEMORY_MIB} MiB"
 echo "Log              : $LOG_FILE"
 echo "============================================================"
 
@@ -201,8 +220,77 @@ install_ubuntu_packages() {
 detect_cuda() {
     have_command nvidia-smi || die "nvidia-smi was not found. Install the NVIDIA driver first."
 
-    echo "[CUDA] Visible GPUs:"
-    nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
+    [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die \
+        "GPU_ID must be a non-negative integer, got: $GPU_ID"
+
+    echo "[CUDA] All physical GPUs:"
+    nvidia-smi \
+        --query-gpu=index,name,memory.total,memory.used,memory.free,driver_version \
+        --format=csv,noheader || true
+
+    if ! nvidia-smi -i "$GPU_ID" --query-gpu=index --format=csv,noheader,nounits \
+        >/dev/null 2>&1; then
+        die "Physical GPU $GPU_ID does not exist or is not accessible."
+    fi
+
+    local gpu_name=""
+    local total_mib=""
+    local used_mib=""
+    local free_mib=""
+    local driver_version=""
+
+    gpu_name="$(
+        nvidia-smi -i "$GPU_ID" \
+            --query-gpu=name \
+            --format=csv,noheader \
+        | head -n 1 | xargs
+    )"
+    total_mib="$(
+        nvidia-smi -i "$GPU_ID" \
+            --query-gpu=memory.total \
+            --format=csv,noheader,nounits \
+        | head -n 1 | xargs
+    )"
+    used_mib="$(
+        nvidia-smi -i "$GPU_ID" \
+            --query-gpu=memory.used \
+            --format=csv,noheader,nounits \
+        | head -n 1 | xargs
+    )"
+    free_mib="$(
+        nvidia-smi -i "$GPU_ID" \
+            --query-gpu=memory.free \
+            --format=csv,noheader,nounits \
+        | head -n 1 | xargs
+    )"
+    driver_version="$(
+        nvidia-smi -i "$GPU_ID" \
+            --query-gpu=driver_version \
+            --format=csv,noheader \
+        | head -n 1 | xargs
+    )"
+
+    echo "[CUDA] Selected physical GPU : $GPU_ID"
+    echo "[CUDA] GPU name              : $gpu_name"
+    echo "[CUDA] VRAM total            : ${total_mib} MiB"
+    echo "[CUDA] VRAM used             : ${used_mib} MiB"
+    echo "[CUDA] VRAM free             : ${free_mib} MiB"
+    echo "[CUDA] Driver                : $driver_version"
+    echo "[CUDA] PyTorch logical GPU   : cuda:0"
+    echo "[CUDA] CUDA_VISIBLE_DEVICES  : $CUDA_VISIBLE_DEVICES"
+
+    if [[ "$free_mib" =~ ^[0-9]+$ ]] \
+        && (( free_mib < MIN_FREE_GPU_MEMORY_MIB )); then
+        local message
+        message="Physical GPU $GPU_ID has only ${free_mib} MiB free; recommended minimum is ${MIN_FREE_GPU_MEMORY_MIB} MiB."
+
+        if [[ "$STRICT_GPU_MEMORY_CHECK" == "1" ]]; then
+            die "$message"
+        fi
+
+        echo "WARNING: $message"
+        echo "WARNING: Check running processes with: nvidia-smi -i $GPU_ID"
+    fi
 
     if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
         :
@@ -295,14 +383,29 @@ setup_python_environment() {
     source "$REPO_DIR/.venv/bin/activate"
 
     echo "[Env] Python: $(python --version)"
-    python - <<'PYVERIFY'
+    CUDA_VISIBLE_DEVICES="$GPU_ID" PHYSICAL_GPU_ID="$GPU_ID" python - <<'PYVERIFY'
+import os
 import torch
+
 print("PyTorch:", torch.__version__)
 print("Torch CUDA:", torch.version.cuda)
 print("CUDA available:", torch.cuda.is_available())
+print("Selected physical GPU:", os.environ.get("PHYSICAL_GPU_ID"))
+print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+
 if not torch.cuda.is_available():
-    raise SystemExit("PyTorch cannot access CUDA.")
-print("GPU:", torch.cuda.get_device_name(0))
+    raise SystemExit("PyTorch cannot access the selected CUDA GPU.")
+
+if torch.cuda.device_count() != 1:
+    raise SystemExit(
+        f"Expected exactly one visible CUDA GPU, got {torch.cuda.device_count()}."
+    )
+
+free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+print("PyTorch logical GPU:", 0)
+print("GPU name:", torch.cuda.get_device_name(0))
+print("Visible VRAM free MiB:", free_bytes // (1024 * 1024))
+print("Visible VRAM total MiB:", total_bytes // (1024 * 1024))
 PYVERIFY
 }
 
@@ -1533,7 +1636,9 @@ run_training() {
     export DRY_RUN
     export OUT_ROOT
     export PYTORCH_ALLOC_CONF
+    export CUDA_DEVICE_ORDER
     export CUDA_VISIBLE_DEVICES="$GPU_ID"
+    export PHYSICAL_GPU_ID="$GPU_ID"
     export PYTHONUNBUFFERED=1
     export MAX_JOBS
 
@@ -1548,6 +1653,9 @@ run_training() {
     echo "TRAINING CONFIGURATION"
     echo "============================================================"
     echo "Dataset              : $REPO_DIR/data/$SCENE_NAME"
+    echo "Physical GPU         : $GPU_ID"
+    echo "PyTorch GPU          : cuda:0 (mapped from physical GPU $GPU_ID)"
+    echo "CUDA visible devices : $CUDA_VISIBLE_DEVICES"
     echo "Appearance mode      : $APPEARANCE_MODE"
     echo "Max steps            : $MAX_STEPS"
     echo "Geometry steps       : $GEOMETRY_STEPS"
