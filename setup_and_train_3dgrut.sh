@@ -1,49 +1,29 @@
 #!/usr/bin/env bash
 #
-# One-file installer + trainer for nv-tlabs/3dgrut v2.
+# One-file renderer for the matching 3DGRUT v2 training launcher.
 #
-# This script:
-#   1. Checks NVIDIA/CUDA prerequisites.
-#   2. Optionally installs Ubuntu build packages.
-#   3. Clones nv-tlabs/3dgrut and checks out the pinned tested commit.
-#   4. Runs NVIDIA's official UV environment installer.
-#   5. Links a COLMAP dataset into the repository.
-#   6. Generates the complete Python training launcher embedded below.
-#   7. Starts 3DGUT + MCMC + NHT training with live progress.
-#   8. Saves on Ctrl+C and auto-resumes on the next run.
-#
-# The training Python file does NOT need to be uploaded separately.
-#
-# Expected project layout (automatically detected):
+# Expected layout:
 #
 #   ~/ai-tuyen/
 #   ├── bts_ai_race/
-#   │   └── setup_and_train_3dgrut.sh
-#   └── dataset/
-#       └── phase1/
-#           └── public_set/
-#               └── HCM0181/
-#                   ├── train/
-#                   │   ├── images/
-#                   │   └── sparse/0/
-#                   └── test/
+#   │   ├── setup_and_train_3dgrut.sh
+#   │   └── render_3dgrut.sh
+#   ├── dataset/phase1/public_set/HCM0181/
+#   │   ├── train/images
+#   │   ├── train/sparse/0
+#   │   └── test/
+#   │       ├── test_poses.csv
+#   │       └── images                 # optional GT for evaluation
+#   └── 3dgrut_workspace/3dgrut/
+#       ├── .venv
+#       └── runs
 #
-# Default run:
+# Usage:
 #
-#   cd ~/ai-tuyen/bts_ai_race
-#   GPU_ID=1 bash setup_and_train_3dgrut.sh
-#
-# Select another scene:
-#
-#   GPU_ID=1 bash setup_and_train_3dgrut.sh HCM0204
-#
-# RTX 4060 8 GB safer override:
-#
-#   CAP_MAX=1500000 \
-#   NHT_FEATURE_DIM=32 \
-#   GPU_ID=1 bash setup_and_train_3dgrut.sh HCM0181
-#
-# DATASET_SOURCE can still be supplied explicitly for a custom location.
+#   bash render_3dgrut.sh HCM0181
+#   CHECKPOINT_STEP=30000 bash render_3dgrut.sh HCM0181
+#   CHECKPOINT_STEP=last bash render_3dgrut.sh HCM0181
+#   ENABLE_EVALUATION=false bash render_3dgrut.sh HCM0181
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -52,110 +32,79 @@ on_error() {
     local exit_code=$?
     echo
     echo "============================================================" >&2
-    echo "FAILED at line ${BASH_LINENO[0]} with exit code ${exit_code}" >&2
-    echo "Log file: ${LOG_FILE:-not-created}" >&2
+    echo "RENDER FAILED at line ${BASH_LINENO[0]} (exit ${exit_code})" >&2
+    echo "Log: ${LOG_FILE:-not-created}" >&2
     echo "============================================================" >&2
-    exit "${exit_code}"
+    exit "$exit_code"
 }
 trap on_error ERR
 
-on_interrupt() {
-    echo
-    echo "============================================================" >&2
-    echo "INTERRUPT REQUESTED" >&2
-    echo "The patched trainer will save ckpt_last.pt before exiting." >&2
-    echo "Run this same command again; AUTO_RESUME=true will continue it." >&2
-    echo "============================================================" >&2
-}
-trap on_interrupt INT
-
 # =============================================================================
-# USER CONFIGURATION
-# Override any value by exporting it before running this script.
+# CONFIGURATION
 # =============================================================================
 
-# Resolve paths from this shell file, not from the current working directory.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 AI_TUYEN_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 
-# The first positional argument may select another scene:
-#   bash setup_and_train_3dgrut.sh HCM0204
 SCENE_NAME="${1:-${SCENE_NAME:-HCM0181}}"
-
-# Default dataset location for the current project layout.
 PUBLIC_SET_ROOT="${PUBLIC_SET_ROOT:-$AI_TUYEN_ROOT/dataset/phase1/public_set}"
 DATASET_SOURCE="${DATASET_SOURCE:-}"
 
-# Keep the large cloned repository, .venv and run outputs outside bts_ai_race.
 WORK_ROOT="${WORK_ROOT:-$AI_TUYEN_ROOT/3dgrut_workspace}"
 REPO_DIR="${REPO_DIR:-$WORK_ROOT/3dgrut}"
-REPO_URL="${REPO_URL:-https://github.com/nv-tlabs/3dgrut.git}"
-REPO_COMMIT="${REPO_COMMIT:-a37ef721012dea0f29c0fcfff2d525023b4e854a}"
-
-# Physical NVIDIA GPU index. This server should train on GPU 1 by default.
-# Override when needed, for example: GPU_ID=0 bash setup_and_train_3dgrut.sh
-GPU_ID="${GPU_ID:-1}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
-
-APPEARANCE_MODE="${APPEARANCE_MODE:-native_distortion}"
-MAX_STEPS="${MAX_STEPS:-35000}"
-GEOMETRY_STEPS="${GEOMETRY_STEPS:-25000}"
-COLOR_REFINE_STEPS="${COLOR_REFINE_STEPS:-10000}"
-SAVE_STEPS="${SAVE_STEPS:-30000,32500,35000}"
-
-CAP_MAX="${CAP_MAX:-2000000}"
-NHT_FEATURE_DIM="${NHT_FEATURE_DIM:-48}"
-DATA_FACTOR="${DATA_FACTOR:-1}"
-TEST_SPLIT_INTERVAL="${TEST_SPLIT_INTERVAL:-0}"
-
-NORMALIZE_WORLD_SPACE="${NORMALIZE_WORLD_SPACE:-false}"
-GSPLAT_IMAGE_DOWNSCALE="${GSPLAT_IMAGE_DOWNSCALE:-false}"
-FORCE_REBUILD_PHOTOMETRIC="${FORCE_REBUILD_PHOTOMETRIC:-false}"
-OVERWRITE_EXPERIMENT="${OVERWRITE_EXPERIMENT:-false}"
-DRY_RUN="${DRY_RUN:-false}"
-
-# Resume the newest checkpoint found under the same experiment name.
-AUTO_RESUME="${AUTO_RESUME:-true}"
-
-# Patch train.py so Ctrl+C first writes ckpt_last.pt, then exits.
-SAVE_ON_INTERRUPT="${SAVE_ON_INTERRUPT:-true}"
-
-# Keep Rich's live progress bar while also recording a terminal log.
-USE_PTY_LOGGING="${USE_PTY_LOGGING:-true}"
-
-# tiny-cuda-nn JIT currently fails on this server's runtime include discovery.
-# 0 avoids the warning and uses the stable non-JIT path. Set 1 to retry JIT.
-TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
-
-RUN_NAME="${RUN_NAME:-}"
 OUT_ROOT="${OUT_ROOT:-$REPO_DIR/runs}"
+VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv}"
 
-# 1: try apt installation when possible; 0: never call apt.
-INSTALL_SYSTEM_PACKAGES="${INSTALL_SYSTEM_PACKAGES:-1}"
+# The official installer places slangc in .venv/bin. Rendering uses Python
+# through an absolute path, so explicitly expose the whole environment too.
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$VENV_DIR}"
+export UV_PYTHON="${UV_PYTHON:-$VENV_DIR/bin/python}"
+export PATH="$VENV_DIR/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
 
-# 1: rerun NVIDIA's installer even when the environment marker exists.
-FORCE_ENV_SETUP="${FORCE_ENV_SETUP:-0}"
+AUTO_INSTALL_SLANGC="${AUTO_INSTALL_SLANGC:-true}"
+SLANGC_EXPECTED_VERSION="${SLANGC_EXPECTED_VERSION:-2026.5.2}"
 
-# Limit parallel native compilation to avoid host RAM exhaustion.
-MAX_JOBS="${MAX_JOBS:-8}"
-
-# Warn before training when the selected physical GPU has less free VRAM.
-# For the default 2M Gaussian + NHT feature-dim 48 configuration, 30 GiB is a
-# conservative preflight threshold on this 46 GiB L40S server.
-MIN_FREE_GPU_MEMORY_MIB="${MIN_FREE_GPU_MEMORY_MIB:-30000}"
-
-# Set STRICT_GPU_MEMORY_CHECK=1 to stop instead of only warning.
-STRICT_GPU_MEMORY_CHECK="${STRICT_GPU_MEMORY_CHECK:-0}"
-
-# Modern PyTorch allocator variable.
-PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
-
-# Apply physical-GPU selection before environment validation and training.
-# Inside PyTorch this selected physical GPU becomes logical cuda:0.
+# Physical GPU on the server. It becomes logical cuda:0 in Python.
+GPU_ID="${GPU_ID:-1}"
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export PHYSICAL_GPU_ID="$GPU_ID"
+
+APPEARANCE_MODE="${APPEARANCE_MODE:-native_distortion}"
+MAX_STEPS="${MAX_STEPS:-35000}"
+CAP_MAX="${CAP_MAX:-2000000}"
+NHT_FEATURE_DIM="${NHT_FEATURE_DIM:-48}"
+RUN_NAME="${RUN_NAME:-${SCENE_NAME}_3dgrut_v2_3dgut_mcmc_nht_${APPEARANCE_MODE}_$((MAX_STEPS / 1000))k_$((CAP_MAX / 1000000))m_fd${NHT_FEATURE_DIM}}"
+
+# last = newest ckpt_last.pt, or newest exact checkpoint if no last exists.
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-last}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+
+LPIPS_NET="${LPIPS_NET:-vgg}"
+ENABLE_EVALUATION="${ENABLE_EVALUATION:-auto}"
+USE_NATIVE_DISTORTION="${USE_NATIVE_DISTORTION:-true}"
+USE_FEATURE_DECODER_EMA="${USE_FEATURE_DECODER_EMA:-true}"
+
+OVERWRITE_RENDER="${OVERWRITE_RENDER:-false}"
+SAVE_ALPHA="${SAVE_ALPHA:-false}"
+MAX_IMAGES="${MAX_IMAGES:-}"
+FORCE_OUTPUT_EXTENSION="${FORCE_OUTPUT_EXTENSION:-}"
+RESIZE_PREDICTION_TO_GT="${RESIZE_PREDICTION_TO_GT:-false}"
+CONTINUE_ON_EVAL_ERROR="${CONTINUE_ON_EVAL_ERROR:-true}"
+
+# Continue a partially rendered set by keeping existing images.
+# Set OVERWRITE_RENDER=true to regenerate every image.
+
+# Avoid the known tiny-cuda-nn RTC warning on this server.
+TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
+export TCNN_JIT_FUSION
+
+# Preserve tqdm/Rich output while also writing a log.
+USE_PTY_LOGGING="${USE_PTY_LOGGING:-true}"
+PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_ALLOC_CONF
+export PYTHONUNBUFFERED=1
 
 # =============================================================================
 # LOGGING
@@ -163,46 +112,21 @@ export PYTORCH_ALLOC_CONF
 
 mkdir -p "$WORK_ROOT/logs"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${LOG_FILE:-$WORK_ROOT/logs/3dgrut_${SCENE_NAME}_${TIMESTAMP}.log}"
+LOG_FILE="${LOG_FILE:-$WORK_ROOT/logs/render_${SCENE_NAME}_${CHECKPOINT_STEP}_${TIMESTAMP}.log}"
 
-# Rich progress bars require a TTY. Re-run this same script once inside
-# util-linux `script`, which provides a pseudo-terminal and records the output.
 if [[ "$USE_PTY_LOGGING" == "true" \
-   && -z "${_3DGRUT_PTY_ACTIVE:-}" \
+   && -z "${_3DGRUT_RENDER_PTY_ACTIVE:-}" \
    && -t 1 \
    && -x "$(command -v script 2>/dev/null || true)" ]]; then
-    export _3DGRUT_PTY_ACTIVE=1
+    export _3DGRUT_RENDER_PTY_ACTIVE=1
     export LOG_FILE
-    printf -v _3DGRUT_REEXEC_COMMAND '%q ' bash "$0" "$@"
-    exec script -q -f -e -c "$_3DGRUT_REEXEC_COMMAND" "$LOG_FILE"
+    printf -v _3DGRUT_RENDER_REEXEC '%q ' bash "$0" "$@"
+    exec script -q -f -e -c "$_3DGRUT_RENDER_REEXEC" "$LOG_FILE"
 fi
 
-# Non-interactive fallback (nohup, CI, redirected output). This records logs,
-# but a live Rich progress bar cannot be rendered without a terminal.
-if [[ -z "${_3DGRUT_PTY_ACTIVE:-}" ]]; then
+if [[ -z "${_3DGRUT_RENDER_PTY_ACTIVE:-}" ]]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
-
-echo "============================================================"
-echo "3DGRUT ONE-FILE SETUP + TRAIN"
-echo "============================================================"
-echo "Date             : $(date --iso-8601=seconds)"
-echo "Script directory : $SCRIPT_DIR"
-echo "AI Tuyen root    : $AI_TUYEN_ROOT"
-echo "Public set root  : $PUBLIC_SET_ROOT"
-echo "Scene            : $SCENE_NAME"
-echo "Work root        : $WORK_ROOT"
-echo "Repository       : $REPO_DIR"
-echo "Pinned commit    : $REPO_COMMIT"
-echo "Physical GPU ID  : $GPU_ID"
-echo "CUDA visible     : $CUDA_VISIBLE_DEVICES"
-echo "Min free VRAM    : ${MIN_FREE_GPU_MEMORY_MIB} MiB"
-echo "Auto resume      : $AUTO_RESUME"
-echo "Save on Ctrl+C   : $SAVE_ON_INTERRUPT"
-echo "PTY progress     : $USE_PTY_LOGGING"
-echo "TCNN JIT fusion  : $TCNN_JIT_FUSION"
-echo "Log              : $LOG_FILE"
-echo "============================================================"
 
 # =============================================================================
 # HELPERS
@@ -217,290 +141,17 @@ have_command() {
     command -v "$1" >/dev/null 2>&1
 }
 
-install_ubuntu_packages() {
-    [[ "$INSTALL_SYSTEM_PACKAGES" == "1" ]] || {
-        echo "[System] Skipping apt packages because INSTALL_SYSTEM_PACKAGES=0."
-        return 0
-    }
-
-    have_command apt-get || {
-        echo "[System] apt-get is unavailable; skipping system package installation."
-        return 0
-    }
-
-    local -a prefix=()
-    if [[ "$(id -u)" -eq 0 ]]; then
-        prefix=()
-    elif have_command sudo && sudo -n true >/dev/null 2>&1; then
-        prefix=(sudo)
-    else
-        echo "[System] No root/non-interactive sudo access; skipping apt packages."
-        echo "[System] Install build-essential, cmake, ninja, git, curl and OpenGL headers manually if setup fails."
-        return 0
-    fi
-
-    echo "[System] Installing Ubuntu build dependencies..."
-    "${prefix[@]}" apt-get update
-    DEBIAN_FRONTEND=noninteractive "${prefix[@]}" apt-get install -y --no-install-recommends \
-        ca-certificates \
-        git \
-        curl \
-        wget \
-        build-essential \
-        cmake \
-        ninja-build \
-        pkg-config \
-        ffmpeg \
-        unzip \
-        libgl1-mesa-dev \
-        libegl1-mesa-dev \
-        libx11-dev \
-        libxi-dev \
-        libxrandr-dev \
-        libxinerama-dev \
-        libxcursor-dev \
-        libglvnd-dev
-}
-
-detect_cuda() {
-    have_command nvidia-smi || die "nvidia-smi was not found. Install the NVIDIA driver first."
-
-    [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die \
-        "GPU_ID must be a non-negative integer, got: $GPU_ID"
-
-    echo "[CUDA] All physical GPUs:"
-    nvidia-smi \
-        --query-gpu=index,name,memory.total,memory.used,memory.free,driver_version \
-        --format=csv,noheader || true
-
-    if ! nvidia-smi -i "$GPU_ID" --query-gpu=index --format=csv,noheader,nounits \
-        >/dev/null 2>&1; then
-        die "Physical GPU $GPU_ID does not exist or is not accessible."
-    fi
-
-    local gpu_name=""
-    local total_mib=""
-    local used_mib=""
-    local free_mib=""
-    local driver_version=""
-
-    gpu_name="$(
-        nvidia-smi -i "$GPU_ID" \
-            --query-gpu=name \
-            --format=csv,noheader \
-        | head -n 1 | xargs
-    )"
-    total_mib="$(
-        nvidia-smi -i "$GPU_ID" \
-            --query-gpu=memory.total \
-            --format=csv,noheader,nounits \
-        | head -n 1 | xargs
-    )"
-    used_mib="$(
-        nvidia-smi -i "$GPU_ID" \
-            --query-gpu=memory.used \
-            --format=csv,noheader,nounits \
-        | head -n 1 | xargs
-    )"
-    free_mib="$(
-        nvidia-smi -i "$GPU_ID" \
-            --query-gpu=memory.free \
-            --format=csv,noheader,nounits \
-        | head -n 1 | xargs
-    )"
-    driver_version="$(
-        nvidia-smi -i "$GPU_ID" \
-            --query-gpu=driver_version \
-            --format=csv,noheader \
-        | head -n 1 | xargs
-    )"
-
-    echo "[CUDA] Selected physical GPU : $GPU_ID"
-    echo "[CUDA] GPU name              : $gpu_name"
-    echo "[CUDA] VRAM total            : ${total_mib} MiB"
-    echo "[CUDA] VRAM used             : ${used_mib} MiB"
-    echo "[CUDA] VRAM free             : ${free_mib} MiB"
-    echo "[CUDA] Driver                : $driver_version"
-    echo "[CUDA] PyTorch logical GPU   : cuda:0"
-    echo "[CUDA] CUDA_VISIBLE_DEVICES  : $CUDA_VISIBLE_DEVICES"
-
-    if [[ "$free_mib" =~ ^[0-9]+$ ]] \
-        && (( free_mib < MIN_FREE_GPU_MEMORY_MIB )); then
-        local message
-        message="Physical GPU $GPU_ID has only ${free_mib} MiB free; recommended minimum is ${MIN_FREE_GPU_MEMORY_MIB} MiB."
-
-        if [[ "$STRICT_GPU_MEMORY_CHECK" == "1" ]]; then
-            die "$message"
-        fi
-
-        echo "WARNING: $message"
-        echo "WARNING: Check running processes with: nvidia-smi -i $GPU_ID"
-    fi
-
-    if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
-        CUDA_HOME="$(readlink -f "$CUDA_HOME")"
-    elif have_command nvcc; then
-        local nvcc_real
-        nvcc_real="$(readlink -f "$(command -v nvcc)")"
-        CUDA_HOME="$(dirname "$(dirname "$nvcc_real")")"
-    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
-        CUDA_HOME="$(readlink -f /usr/local/cuda)"
-    else
-        local candidate=""
-        for candidate in /usr/local/cuda-*; do
-            if [[ -x "$candidate/bin/nvcc" ]]; then
-                CUDA_HOME="$candidate"
-            fi
-        done
-    fi
-
-    [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] || die \
-        "CUDA toolkit/nvcc was not found. Set CUDA_HOME to a supported CUDA toolkit."
-
-    export CUDA_HOME
-    export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-    local cuda_include_dir=""
-    local include_candidate=""
-    for include_candidate in \
-        "$CUDA_HOME/include" \
-        "$CUDA_HOME/targets/x86_64-linux/include" \
-        "$CUDA_HOME/targets/$(uname -m)-linux/include" \
-        "/usr/local/cuda/include" \
-        "/usr/include"
-    do
-        if [[ -f "$include_candidate/vector_types.h" ]]; then
-            cuda_include_dir="$include_candidate"
-            break
-        fi
-    done
-
-    if [[ -n "$cuda_include_dir" ]]; then
-        export CUDA_INCLUDE_DIR="$cuda_include_dir"
-        export CPATH="$cuda_include_dir${CPATH:+:$CPATH}"
-        export C_INCLUDE_PATH="$cuda_include_dir${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
-        export CPLUS_INCLUDE_PATH="$cuda_include_dir${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
-        echo "[CUDA] Runtime include=$cuda_include_dir"
-        echo "[CUDA] vector_types.h found"
-    else
-        echo "WARNING: vector_types.h was not found under CUDA_HOME or standard include paths."
-        echo "WARNING: TCNN JIT will remain disabled unless TCNN_JIT_FUSION=1 is requested."
-    fi
-
-    echo "[CUDA] CUDA_HOME=$CUDA_HOME"
-    echo "[CUDA] nvcc real path=$(readlink -f "$CUDA_HOME/bin/nvcc")"
-    "$CUDA_HOME/bin/nvcc" --version
-}
-
-install_uv() {
-    if have_command uv; then
-        echo "[UV] Reusing $(uv --version)"
-        return 0
-    fi
-
-    have_command curl || die "curl is required to install uv."
-    echo "[UV] Installing uv..."
-    curl -LsSf --retry 5 --retry-delay 2 https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    have_command uv || die "uv installation completed but the uv command is still unavailable."
-    echo "[UV] Installed $(uv --version)"
-}
-
-clone_or_update_repo() {
-    mkdir -p "$(dirname "$REPO_DIR")"
-
-    if [[ ! -d "$REPO_DIR/.git" ]]; then
-        echo "[Git] Cloning $REPO_URL ..."
-        git clone --filter=blob:none "$REPO_URL" "$REPO_DIR"
-    else
-        echo "[Git] Existing repository found: $REPO_DIR"
-    fi
-
-    cd "$REPO_DIR"
-    git remote set-url origin "$REPO_URL"
-    git reset --hard
-    git fetch --force origin "$REPO_COMMIT"
-    git checkout --detach "$REPO_COMMIT"
-    git reset --hard "$REPO_COMMIT"
-    git submodule sync --recursive
-    git submodule update --init --recursive
-
-    local actual
-    actual="$(git rev-parse HEAD)"
-    [[ "$actual" == "$REPO_COMMIT" ]] || die \
-        "Repository revision mismatch: expected $REPO_COMMIT, got $actual"
-
-    echo "[Git] Checked out: $actual"
-}
-
-setup_python_environment() {
-    cd "$REPO_DIR"
-
-    [[ -f install_env_uv.sh ]] || die \
-        "The pinned checkout does not contain install_env_uv.sh."
-
-    local marker="$REPO_DIR/.env_setup_${REPO_COMMIT}"
-    if [[ "$FORCE_ENV_SETUP" == "1" || ! -x "$REPO_DIR/.venv/bin/python" || ! -f "$marker" ]]; then
-        echo "[Env] Running NVIDIA's official install_env_uv.sh ..."
-        export MAX_JOBS
-        bash install_env_uv.sh 3dgrut
-        touch "$marker"
-    else
-        echo "[Env] Existing completed environment detected; skipping reinstall."
-        echo "[Env] Set FORCE_ENV_SETUP=1 to rebuild it."
-    fi
-
-    [[ -x "$REPO_DIR/.venv/bin/python" ]] || die \
-        "Python virtual environment was not created at $REPO_DIR/.venv"
-
-    # shellcheck disable=SC1091
-    source "$REPO_DIR/.venv/bin/activate"
-
-    echo "[Env] Python: $(python --version)"
-    CUDA_VISIBLE_DEVICES="$GPU_ID" PHYSICAL_GPU_ID="$GPU_ID" python - <<'PYVERIFY'
-import os
-import torch
-
-print("PyTorch:", torch.__version__)
-print("Torch CUDA:", torch.version.cuda)
-print("CUDA available:", torch.cuda.is_available())
-print("Selected physical GPU:", os.environ.get("PHYSICAL_GPU_ID"))
-print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
-
-if not torch.cuda.is_available():
-    raise SystemExit("PyTorch cannot access the selected CUDA GPU.")
-
-if torch.cuda.device_count() != 1:
-    raise SystemExit(
-        f"Expected exactly one visible CUDA GPU, got {torch.cuda.device_count()}."
-    )
-
-free_bytes, total_bytes = torch.cuda.mem_get_info(0)
-print("PyTorch logical GPU:", 0)
-print("GPU name:", torch.cuda.get_device_name(0))
-print("Visible VRAM free MiB:", free_bytes // (1024 * 1024))
-print("Visible VRAM total MiB:", total_bytes // (1024 * 1024))
-PYVERIFY
-}
-
 auto_find_dataset() {
-    # Respect an explicitly supplied valid path.
     if [[ -n "$DATASET_SOURCE" && -d "$DATASET_SOURCE" ]]; then
         return 0
     fi
 
-    local candidate=""
     local root=""
-
-    # Search the project's public dataset first. Scene matching is
-    # case-insensitive because some folders are lowercase (for example hcm0031).
+    local candidate=""
     for root in \
         "$PUBLIC_SET_ROOT" \
         "$AI_TUYEN_ROOT/dataset/phase1/private_set1" \
-        "$AI_TUYEN_ROOT/dataset/phase1" \
-        "$WORK_ROOT/data" \
-        "$WORK_ROOT/datasets"
+        "$AI_TUYEN_ROOT/dataset/phase1"
     do
         [[ -d "$root" ]] || continue
 
@@ -523,34 +174,21 @@ auto_find_dataset() {
             return 0
         fi
     done
-
-    # Compatibility with the older directory layout.
-    for candidate in \
-        "$SCRIPT_DIR/data/$SCENE_NAME" \
-        "$REPO_DIR/data/$SCENE_NAME" \
-        "$HOME/ai_race_2026/data/$SCENE_NAME"
-    do
-        if [[ -d "$candidate" ]]; then
-            DATASET_SOURCE="$candidate"
-            return 0
-        fi
-    done
 }
 
-prepare_dataset_link() {
+prepare_dataset_view() {
     auto_find_dataset
     [[ -n "$DATASET_SOURCE" ]] || die \
-        "Could not auto-detect scene '$SCENE_NAME'. Expected: $PUBLIC_SET_ROOT/$SCENE_NAME. Set DATASET_SOURCE explicitly for another location."
+        "Scene '$SCENE_NAME' was not found under $PUBLIC_SET_ROOT"
 
     DATASET_SOURCE="$(readlink -f "$DATASET_SOURCE")"
-    [[ -d "$DATASET_SOURCE" ]] || die "Dataset directory does not exist: $DATASET_SOURCE"
+    local ready_root=""
 
-    local ready_root
     if [[ -d "$DATASET_SOURCE/images" && -d "$DATASET_SOURCE/sparse/0" ]]; then
         ready_root="$DATASET_SOURCE"
-    elif [[ -d "$DATASET_SOURCE/train/images" && -d "$DATASET_SOURCE/train/sparse/0" ]]; then
+    elif [[ -d "$DATASET_SOURCE/train/images" \
+         && -d "$DATASET_SOURCE/train/sparse/0" ]]; then
         local view_root="$WORK_ROOT/dataset_views/$SCENE_NAME"
-        echo "[Data] Competition train/ layout detected; creating a non-destructive dataset view."
         rm -rf "$view_root"
         mkdir -p "$view_root"
         ln -s "$DATASET_SOURCE/train/images" "$view_root/images"
@@ -561,999 +199,188 @@ prepare_dataset_link() {
         ready_root="$view_root"
     else
         die \
-            "Unsupported dataset layout. Expected images+sparse/0 or train/images+train/sparse/0 under: $DATASET_SOURCE"
+            "Expected images+sparse/0 or train/images+train/sparse/0 in $DATASET_SOURCE"
     fi
 
-    local required
-    for required in \
-        "$ready_root/images" \
-        "$ready_root/sparse/0/cameras.bin" \
-        "$ready_root/sparse/0/images.bin" \
-        "$ready_root/sparse/0/points3D.bin"
-    do
-        [[ -e "$required" ]] || die "Missing dataset component: $required"
-    done
+    [[ -f "$ready_root/sparse/0/cameras.bin" ]] || die \
+        "Missing cameras.bin: $ready_root/sparse/0/cameras.bin"
+    [[ -f "$ready_root/test/test_poses.csv" ]] || die \
+        "Missing test_poses.csv: $ready_root/test/test_poses.csv"
 
     mkdir -p "$REPO_DIR/data"
     local target="$REPO_DIR/data/$SCENE_NAME"
 
     if [[ -L "$target" ]]; then
         rm -f "$target"
-    elif [[ -e "$target" ]]; then
-        if [[ "$(readlink -f "$target")" != "$(readlink -f "$ready_root")" ]]; then
-            die \
-                "A real, different dataset path already exists at $target. Move it or set REPO_DIR to another location."
-        fi
+    elif [[ -e "$target" \
+         && "$(readlink -f "$target")" != "$(readlink -f "$ready_root")" ]]; then
+        die "A different real dataset path already exists at: $target"
     fi
 
     if [[ ! -e "$target" ]]; then
         ln -s "$ready_root" "$target"
     fi
 
-    echo "[Data] Scene           : $SCENE_NAME"
-    echo "[Data] Public set root : $PUBLIC_SET_ROOT"
-    echo "[Data] Source          : $DATASET_SOURCE"
-    echo "[Data] Training root   : $ready_root"
-    echo "[Data] Repository link : $target -> $(readlink -f "$target")"
+    export DATA_ROOT="$REPO_DIR/data"
+    export SCENE_ROOT="$target"
+    export TEST_ROOT="$target/test"
+    export TEST_CSV_PATH="$target/test/test_poses.csv"
+    export GT_DIR="$target/test/images"
+    export CAMERAS_BIN_PATH="$target/sparse/0/cameras.bin"
+
+    echo "[Data] Scene         : $SCENE_NAME"
+    echo "[Data] Source        : $DATASET_SOURCE"
+    echo "[Data] Render view   : $ready_root"
+    echo "[Data] Repository    : $target"
+    echo "[Data] Test CSV      : $TEST_CSV_PATH"
+    if [[ -d "$GT_DIR" ]]; then
+        echo "[Data] Test GT       : $GT_DIR"
+    else
+        echo "[Data] Test GT       : not present; render-only mode available"
+    fi
 }
 
-write_embedded_trainer() {
-    TRAIN_LAUNCHER="$REPO_DIR/train_3dgrut_v2_embedded.py"
-    cat > "$TRAIN_LAUNCHER" <<'__TRAIN_3DGRUT_V2_PY__'
-#!/usr/bin/env python3
-"""
-Native 3DGRUT v2 training launcher.
+check_runtime() {
+    [[ -d "$REPO_DIR/.git" ]] || die \
+        "3DGRUT repository not found at $REPO_DIR. Run setup_and_train_3dgrut.sh first."
+    [[ -x "$VENV_DIR/bin/python" ]] || die \
+        "3DGRUT .venv not found at $VENV_DIR. Run training setup first."
+    [[ -f "$REPO_DIR/render.py" ]] || die \
+        "Invalid 3DGRUT repository: $REPO_DIR/render.py is missing."
 
-Pipeline:
-- Native 3DGUT rasterizer and native COLMAP distortion (SIMPLE_RADIAL supported).
-- MCMC capped at 2,000,000 Gaussians.
-- Neural Harmonic Textures with feature dimension 48.
-- 25k geometry/appearance + 10k NHT color-only refinement.
-- Photometric v2-mild preprocessing for the recommended native-distortion run.
-- Horizon-aware weighted L1 and Sobel edge loss.
-- Optional raw-data + PPISP ablation.
+    # Restore PATH and compiler variables persisted by install_env_uv.sh.
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+    export UV_PYTHON="$VENV_DIR/bin/python"
+    export PATH="$VENV_DIR/bin:$PATH"
+    hash -r
 
-Place this file in the root of nv-tlabs/3dgrut next to train.py.
-"""
+    echo "[Runtime] Venv          : $VENV_DIR"
+    echo "[Runtime] Python        : $(command -v python)"
+    echo "[Runtime] PATH head     : ${PATH%%:*}"
 
-from __future__ import annotations
+    command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable."
+    [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die "GPU_ID must be an integer."
+    nvidia-smi -i "$GPU_ID" --query-gpu=index --format=csv,noheader,nounits \
+        >/dev/null 2>&1 || die "Physical GPU $GPU_ID is unavailable."
 
-import csv
-import json
-import math
+    echo "[GPU] Selected physical GPU: $GPU_ID"
+    nvidia-smi -i "$GPU_ID" \
+        --query-gpu=index,name,memory.total,memory.used,memory.free \
+        --format=csv,noheader
+
+    CUDA_VISIBLE_DEVICES="$GPU_ID" "$VENV_DIR/bin/python" - <<'PYVERIFY'
 import os
-import py_compile
+import torch
+
+print("[Python] Version:", os.sys.version.split()[0])
+print("[PyTorch] Version:", torch.__version__)
+print("[PyTorch] CUDA:", torch.version.cuda)
+print("[PyTorch] CUDA available:", torch.cuda.is_available())
+print("[PyTorch] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+if not torch.cuda.is_available():
+    raise SystemExit("PyTorch cannot access the selected GPU.")
+if torch.cuda.device_count() != 1:
+    raise SystemExit(
+        f"Expected exactly one visible GPU, got {torch.cuda.device_count()}."
+    )
+print("[PyTorch] Logical cuda:0:", torch.cuda.get_device_name(0))
+PYVERIFY
+}
+
+ensure_slangc() {
+    local slangc_path=""
+    local actual_version=""
+    local installer="$REPO_DIR/scripts/install_slangc.sh"
+
+    hash -r
+    slangc_path="$(command -v slangc 2>/dev/null || true)"
+
+    if [[ -z "$slangc_path" && -x "$VENV_DIR/bin/slangc" ]]; then
+        export PATH="$VENV_DIR/bin:$PATH"
+        hash -r
+        slangc_path="$(command -v slangc 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$slangc_path" ]]; then
+        [[ "$AUTO_INSTALL_SLANGC" == "true" ]] || die \
+            "slangc was not found. Set AUTO_INSTALL_SLANGC=true or install it into $VENV_DIR/bin."
+
+        [[ -f "$installer" ]] || die \
+            "Official Slang installer not found: $installer"
+
+        command -v wget >/dev/null 2>&1 || die \
+            "wget is required by install_slangc.sh. Install it with: sudo apt install -y wget"
+
+        echo "[Slang] slangc is missing; running the official installer..."
+        (
+            cd "$REPO_DIR"
+            export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+            export PATH="$VENV_DIR/bin:$PATH"
+            bash "$installer"
+        )
+
+        export PATH="$VENV_DIR/bin:$PATH"
+        hash -r
+        slangc_path="$(command -v slangc 2>/dev/null || true)"
+    fi
+
+    [[ -n "$slangc_path" && -x "$slangc_path" ]] || die \
+        "slangc is still unavailable. Expected: $VENV_DIR/bin/slangc"
+
+    actual_version="$("$slangc_path" -version 2>&1 | head -n 1 | tr -d '\r')"
+
+    echo "[Slang] Executable     : $slangc_path"
+    echo "[Slang] Version        : $actual_version"
+    echo "[Slang] Expected       : $SLANGC_EXPECTED_VERSION"
+
+    [[ "$actual_version" == "$SLANGC_EXPECTED_VERSION" ]] || die \
+        "Unexpected slangc version. Expected $SLANGC_EXPECTED_VERSION, got: $actual_version"
+
+    "$VENV_DIR/bin/python" - <<'PYSLANG'
 import shutil
 import subprocess
-import sys
+
+path = shutil.which("slangc")
+if not path:
+    raise SystemExit("Python subprocess environment cannot resolve slangc.")
+version = subprocess.check_output(
+    ["slangc", "-version"],
+    text=True,
+    stderr=subprocess.STDOUT,
+).strip()
+print("[Slang] Python lookup   :", path)
+print("[Slang] Subprocess test :", version)
+PYSLANG
+}
+
+
+patch_tcnn_jit_control() {
+    local feature_file="$REPO_DIR/threedgrut/model/feature_decoder.py"
+    [[ -f "$feature_file" ]] || die "Feature decoder not found: $feature_file"
+
+    "$VENV_DIR/bin/python" - "$feature_file" <<'PYPATCH'
 from pathlib import Path
-from typing import Any, NoReturn
-
-import numpy as np
-
-
-# =============================================================================
-# USER CONFIGURATION
-# =============================================================================
-
-SCENE_NAME = os.environ.get("SCENE_NAME", "HCM0181")
-SCRIPT_ROOT = Path(__file__).resolve().parent
-DATA_ROOT = SCRIPT_ROOT / "data"
-SOURCE_SCENE_ROOT = DATA_ROOT / SCENE_NAME
-PHOTO_DATASET_ROOT = DATA_ROOT / f"{SCENE_NAME}_photo_v4"
-
-# Recommended first run:
-#   native_distortion -> photo_v4 + native SIMPLE_RADIAL + no PPISP
-# Optional ablation:
-#   ppisp_raw         -> raw RGB + native SIMPLE_RADIAL + PPISP
-APPEARANCE_MODE = os.environ.get("APPEARANCE_MODE", "native_distortion")
-
-GPU_ID = int(os.environ.get("GPU_ID", "0"))
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "35000"))
-GEOMETRY_STEPS = int(os.environ.get("GEOMETRY_STEPS", "25000"))
-COLOR_REFINE_STEPS = int(os.environ.get("COLOR_REFINE_STEPS", "10000"))
-SAVE_STEPS = [int(value) for value in os.environ.get("SAVE_STEPS", "30000,32500,35000").split(",") if value.strip()]
-CAP_MAX = int(os.environ.get("CAP_MAX", "2000000"))
-NHT_FEATURE_DIM = int(os.environ.get("NHT_FEATURE_DIM", "48"))
-
-DATA_FACTOR = int(os.environ.get("DATA_FACTOR", "1"))
-NORMALIZE_WORLD_SPACE = os.environ.get("NORMALIZE_WORLD_SPACE", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-GSPLAT_IMAGE_DOWNSCALE = os.environ.get("GSPLAT_IMAGE_DOWNSCALE", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-TEST_SPLIT_INTERVAL = int(os.environ.get("TEST_SPLIT_INTERVAL", "0"))  # 0 = use all available RGB frames
-
-# Native 3DGUT/NHT parameters.
-UT_ALPHA = 0.1
-PARTICLE_FEATURE_HALF = True
-FEATURE_OUTPUT_HALF = True
-PARTICLE_KERNEL_MAX_ALPHA = 0.99
-NHT_DECODER_HIDDEN_DIM = 128
-NHT_DECODER_NUM_LAYERS = 3
-NHT_DECODER_LR = 0.00068
-NHT_DECODER_EMA_DECAY = 0.95
-
-# Regularization from the official 3DGUT-MCMC-NHT app config.
-USE_OPACITY_REG = True
-LAMBDA_OPACITY = 0.02
-USE_SCALE_REG = True
-LAMBDA_SCALE = 0.005
-
-# Horizon-aware loss.
-HORIZON_AWARE_LOSS = True
-HORIZON_REPORT_FILENAME = "_photometric_report.csv"
-HORIZON_TOP_REGION_END = 0.58
-HORIZON_SKY_INTERIOR_END = 0.24
-HORIZON_SKY_LUMA_MIN = 0.55
-HORIZON_SKY_EDGE_MAX = 0.025
-HORIZON_EDGE_THRESHOLD = 0.040
-HORIZON_SKY_WEIGHT = 0.25
-HORIZON_BAND_WEIGHT = 1.25
-HORIZON_TOP_FOREGROUND_WEIGHT = 1.10
-HORIZON_EDGE_LOSS_WEIGHT = 0.02
-
-# PPISP options used only for APPEARANCE_MODE="ppisp_raw".
-# Distillation is disabled so it does not replace the final NHT refinement phase.
-PPISP_USE_CONTROLLER = True
-PPISP_DISTILLATION_STEPS = 0
-
-# Photometric v2-mild preprocessing.
-FORCE_REBUILD_PHOTOMETRIC = os.environ.get("FORCE_REBUILD_PHOTOMETRIC", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-HORIZONTAL_TOP_BOTTOM_RATIO_THRESHOLD = 1.15
-MIN_REFERENCE_IMAGES = 6
-PROFILE_WIDTH = 256
-PROFILE_HEIGHT = 160
-PROFILE_SMOOTH_SIGMA = 5.0
-PROFILE_VALID_LUMA_MIN = 0.015
-PROFILE_VALID_LUMA_MAX = 0.985
-TOP_PROFILE_RANGE = (0.04, 0.34)
-LOWER_PROFILE_RANGE = (0.58, 0.90)
-TOP_FULL_CORRECTION_END = 0.30
-BOTTOM_ZERO_CORRECTION_START = 0.58
-GAIN_MIN = 0.90
-GAIN_MAX = 1.12
-PHOTOMETRIC_STRENGTH = 0.55
-JPEG_QUALITY = 98
-PNG_COMPRESS_LEVEL = 3
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-
-RUN_NAME = os.environ.get(
-    "RUN_NAME",
-    (
-        f"{SCENE_NAME}_3dgrut_v2_3dgut_mcmc_nht_"
-        f"{APPEARANCE_MODE}_{MAX_STEPS // 1000}k_"
-        f"{CAP_MAX // 1_000_000}m_fd{NHT_FEATURE_DIM}"
-    ),
-)
-OUT_ROOT = Path(os.environ.get("OUT_ROOT", str(SCRIPT_ROOT / "runs"))).expanduser().resolve()
-OVERWRITE_EXPERIMENT = os.environ.get("OVERWRITE_EXPERIMENT", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
-AUTO_RESUME = os.environ.get("AUTO_RESUME", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
-SAVE_ON_INTERRUPT = os.environ.get("SAVE_ON_INTERRUPT", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
-TCNN_JIT_FUSION = os.environ.get("TCNN_JIT_FUSION", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-# Tested against this public main commit. The script checks source anchors before patching.
-EXPECTED_3DGRUT_COMMIT = "a37ef721012dea0f29c0fcfff2d525023b4e854a"
-DATASET_PATCH_MARKER = "# BEGIN dataset MISSING RGB FILTER PATCH"
-DATASET_NO_SPLIT_MARKER = "# BEGIN dataset NO-SPLIT INDEX PATCH"
-HORIZON_PATCH_MARKER = "# BEGIN dataset HORIZON LOSS PATCH"
-INTERRUPT_PATCH_MARKER = "# BEGIN SAVE CHECKPOINT ON INTERRUPT PATCH"
-TCNN_JIT_PATCH_MARKER = "# BEGIN TCNN JIT CONTROL PATCH"
-
-
-# =============================================================================
-# COMMON HELPERS
-# =============================================================================
-
-
-def fail(message: str) -> NoReturn:
-    raise RuntimeError(message)
-
-
-def list_images(root: Path) -> list[Path]:
-    if not root.is_dir():
-        return []
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
-
-
-def remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
-        shutil.rmtree(path)
-
-
-def ensure_directory_symlink(link_path: Path, target_path: Path) -> None:
-    target_path = target_path.resolve()
-    if link_path.is_symlink():
-        if link_path.resolve() == target_path:
-            return
-        link_path.unlink()
-    elif link_path.exists():
-        fail(
-            "Cannot create symlink because a real path exists:\n"
-            f"  {link_path}\nRename or remove it first."
-        )
-    link_path.parent.mkdir(parents=True, exist_ok=True)
-    link_path.symlink_to(target_path, target_is_directory=True)
-
-
-def fraction_slice(length: int, interval: tuple[float, float]) -> slice:
-    start = max(0, min(int(round(length * interval[0])), length - 1))
-    end = max(start + 1, min(int(round(length * interval[1])), length))
-    return slice(start, end)
-
-
-def gaussian_kernel_1d(sigma: float) -> np.ndarray:
-    if sigma <= 0:
-        return np.ones(1, dtype=np.float64)
-    radius = max(1, int(math.ceil(3.0 * sigma)))
-    x = np.arange(-radius, radius + 1, dtype=np.float64)
-    kernel = np.exp(-(x * x) / (2.0 * sigma * sigma))
-    return kernel / kernel.sum()
-
-
-def smooth_profile(profile: np.ndarray, sigma: float) -> np.ndarray:
-    kernel = gaussian_kernel_1d(sigma)
-    radius = len(kernel) // 2
-    padded = np.pad(profile.astype(np.float64), (radius, radius), mode="edge")
-    return np.convolve(padded, kernel, mode="valid").astype(np.float64)
-
-
-def smoothstep(values: np.ndarray) -> np.ndarray:
-    values = np.clip(values, 0.0, 1.0)
-    return values * values * (3.0 - 2.0 * values)
-
-
-def srgb_to_linear(image: np.ndarray) -> np.ndarray:
-    image = image.astype(np.float32)
-    return np.where(
-        image <= 0.04045,
-        image / 12.92,
-        ((image + 0.055) / 1.055) ** 2.4,
-    )
-
-
-def linear_to_srgb(image: np.ndarray) -> np.ndarray:
-    image = np.clip(image, 0.0, 1.0)
-    return np.where(
-        image <= 0.0031308,
-        12.92 * image,
-        1.055 * np.power(image, 1.0 / 2.4) - 0.055,
-    )
-
-
-def luminance_linear(rgb: np.ndarray) -> np.ndarray:
-    return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-
-
-# =============================================================================
-# PHOTOMETRIC DATASET
-# =============================================================================
-
-
-def load_profile_rgb(path: Path) -> np.ndarray:
-    from PIL import Image
-
-    with Image.open(path) as image:
-        image = image.convert("RGB").resize(
-            (PROFILE_WIDTH, PROFILE_HEIGHT),
-            Image.Resampling.BILINEAR,
-        )
-        return np.asarray(image, dtype=np.float32) / 255.0
-
-
-def analyze_vertical_profile(path: Path) -> dict[str, Any]:
-    luma = luminance_linear(srgb_to_linear(load_profile_rgb(path)))
-    rows: list[float] = []
-    for row in luma:
-        valid = row[(row >= PROFILE_VALID_LUMA_MIN) & (row <= PROFILE_VALID_LUMA_MAX)]
-        if valid.size < max(8, row.size // 20):
-            valid = row
-        rows.append(float(np.median(valid)))
-
-    profile = smooth_profile(np.asarray(rows), PROFILE_SMOOTH_SIGMA)
-    top = max(float(np.median(profile[fraction_slice(len(profile), TOP_PROFILE_RANGE)])), 1e-6)
-    lower = max(float(np.median(profile[fraction_slice(len(profile), LOWER_PROFILE_RANGE)])), 1e-6)
-    ratio = top / lower
-    return {
-        "normalized_profile": profile / lower,
-        "top_anchor": top,
-        "lower_anchor": lower,
-        "top_bottom_ratio": ratio,
-        "upper_bright": ratio >= HORIZONTAL_TOP_BOTTOM_RATIO_THRESHOLD,
-    }
-
-
-def save_rgb_uint8(rgb: np.ndarray, path: Path) -> None:
-    from PIL import Image
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.fromarray(rgb, mode="RGB")
-    suffix = path.suffix.lower()
-    if suffix in {".jpg", ".jpeg"}:
-        image.save(path, format="JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=False)
-    elif suffix == ".png":
-        image.save(path, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
-    elif suffix == ".webp":
-        image.save(path, format="WEBP", quality=JPEG_QUALITY, method=4)
-    else:
-        image.save(path)
-
-
-def correct_image(
-    source: Path,
-    destination: Path,
-    normalized_profile: np.ndarray,
-    reference_profile: np.ndarray,
-) -> dict[str, float]:
-    from PIL import Image
-
-    with Image.open(source) as image:
-        rgb_srgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-
-    height = rgb_srgb.shape[0]
-    gain = reference_profile / np.maximum(normalized_profile, 1e-6)
-    gain = np.clip(smooth_profile(gain, PROFILE_SMOOTH_SIGMA), GAIN_MIN, GAIN_MAX)
-    source_y = np.linspace(0.0, 1.0, len(gain), dtype=np.float64)
-    target_y = np.linspace(0.0, 1.0, height, dtype=np.float64)
-    gain_y = np.interp(target_y, source_y, gain)
-    fade = (target_y - TOP_FULL_CORRECTION_END) / max(
-        BOTTOM_ZERO_CORRECTION_START - TOP_FULL_CORRECTION_END, 1e-6
-    )
-    top_weight = 1.0 - smoothstep(fade)
-    effective_gain = 1.0 + PHOTOMETRIC_STRENGTH * top_weight * (gain_y - 1.0)
-    effective_gain = np.clip(effective_gain, GAIN_MIN, GAIN_MAX)
-
-    corrected = srgb_to_linear(rgb_srgb) * effective_gain[:, None, None].astype(np.float32)
-    corrected = linear_to_srgb(corrected)
-    rgb_u8 = (np.clip(corrected, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-    save_rgb_uint8(rgb_u8, destination)
-
-    return {
-        "gain_min": float(effective_gain.min()),
-        "gain_max": float(effective_gain.max()),
-        "gain_top_median": float(np.median(effective_gain[fraction_slice(height, TOP_PROFILE_RANGE)])),
-        "gain_lower_median": float(np.median(effective_gain[fraction_slice(height, LOWER_PROFILE_RANGE)])),
-    }
-
-
-def photometric_config() -> dict[str, Any]:
-    return {
-        "version": 2,
-        "source_scene": str(SOURCE_SCENE_ROOT.resolve()),
-        "threshold": HORIZONTAL_TOP_BOTTOM_RATIO_THRESHOLD,
-        "profile_width": PROFILE_WIDTH,
-        "profile_height": PROFILE_HEIGHT,
-        "profile_smooth_sigma": PROFILE_SMOOTH_SIGMA,
-        "top_profile_range": list(TOP_PROFILE_RANGE),
-        "lower_profile_range": list(LOWER_PROFILE_RANGE),
-        "top_full_correction_end": TOP_FULL_CORRECTION_END,
-        "bottom_zero_correction_start": BOTTOM_ZERO_CORRECTION_START,
-        "gain_min": GAIN_MIN,
-        "gain_max": GAIN_MAX,
-        "strength": PHOTOMETRIC_STRENGTH,
-        "jpeg_quality": JPEG_QUALITY,
-    }
-
-
-def photometric_dataset_current(source_files: list[Path]) -> bool:
-    images_dir = PHOTO_DATASET_ROOT / "images"
-    config_path = PHOTO_DATASET_ROOT / "_photometric_config.json"
-    report_path = PHOTO_DATASET_ROOT / HORIZON_REPORT_FILENAME
-    if FORCE_REBUILD_PHOTOMETRIC or not config_path.is_file() or not report_path.is_file():
-        return False
-    try:
-        if json.loads(config_path.read_text(encoding="utf-8")) != photometric_config():
-            return False
-    except Exception:
-        return False
-    generated = list_images(images_dir)
-    if len(generated) != len(source_files):
-        return False
-    source_root = SOURCE_SCENE_ROOT / "images"
-    for source in source_files:
-        destination = images_dir / source.relative_to(source_root)
-        if not destination.is_file() or destination.stat().st_mtime < source.stat().st_mtime:
-            return False
-    return True
-
-
-def prepare_photometric_dataset() -> dict[str, Any]:
-    from tqdm import tqdm
-
-    source_images_root = SOURCE_SCENE_ROOT / "images"
-    source_sparse = SOURCE_SCENE_ROOT / "sparse"
-    source_files = list_images(source_images_root)
-    if not source_files:
-        fail(f"No training images found in: {source_images_root}")
-    if not source_sparse.is_dir():
-        fail(f"Sparse COLMAP directory is missing: {source_sparse}")
-
-    PHOTO_DATASET_ROOT.mkdir(parents=True, exist_ok=True)
-    ensure_directory_symlink(PHOTO_DATASET_ROOT / "sparse", source_sparse)
-    report_path = PHOTO_DATASET_ROOT / HORIZON_REPORT_FILENAME
-
-    if photometric_dataset_current(source_files):
-        corrected = 0
-        upper_bright = 0
-        with report_path.open("r", encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                upper_bright += row.get("upper_bright") == "True"
-                corrected += row.get("corrected") == "True"
-        print("[Photometric] Existing photo_v4 dataset is current; reusing it.")
-        return {
-            "source_images": len(source_files),
-            "upper_bright_images": upper_bright,
-            "corrected_images": corrected,
-            "report_path": str(report_path),
-        }
-
-    destination_root = PHOTO_DATASET_ROOT / "images"
-    if destination_root.exists() or destination_root.is_symlink():
-        remove_path(destination_root)
-    destination_root.mkdir(parents=True, exist_ok=True)
-
-    analyses: dict[str, dict[str, Any]] = {}
-    print("========== PHOTOMETRIC ANALYSIS ==========")
-    for path in tqdm(source_files, desc="Analyzing vertical luminance"):
-        name = path.relative_to(source_images_root).as_posix()
-        analyses[name] = analyze_vertical_profile(path)
-
-    reference_names = [name for name, item in analyses.items() if item["upper_bright"]]
-    correction_enabled = len(reference_names) >= MIN_REFERENCE_IMAGES
-    if correction_enabled:
-        stack = np.stack([analyses[name]["normalized_profile"] for name in reference_names])
-        reference = smooth_profile(np.median(stack, axis=0), PROFILE_SMOOTH_SIGMA)
-        reference /= max(
-            float(np.median(reference[fraction_slice(len(reference), LOWER_PROFILE_RANGE)])),
-            1e-6,
-        )
-    else:
-        reference = np.ones(PROFILE_HEIGHT, dtype=np.float64)
-        print("WARNING: too few upper-bright images; copying all images unchanged.")
-
-    rows: list[dict[str, Any]] = []
-    for source in tqdm(source_files, desc="Writing photo_v4 dataset"):
-        relative = source.relative_to(source_images_root)
-        name = relative.as_posix()
-        destination = destination_root / relative
-        analysis = analyses[name]
-        should_correct = correction_enabled and bool(analysis["upper_bright"])
-        if should_correct:
-            gain_stats = correct_image(
-                source,
-                destination,
-                analysis["normalized_profile"],
-                reference,
-            )
-        else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            gain_stats = {
-                "gain_min": 1.0,
-                "gain_max": 1.0,
-                "gain_top_median": 1.0,
-                "gain_lower_median": 1.0,
-            }
-        rows.append({
-            "image_name": name,
-            "top_anchor": f"{analysis['top_anchor']:.10f}",
-            "lower_anchor": f"{analysis['lower_anchor']:.10f}",
-            "top_bottom_ratio": f"{analysis['top_bottom_ratio']:.10f}",
-            "upper_bright": bool(analysis["upper_bright"]),
-            "corrected": should_correct,
-            **{key: f"{value:.10f}" for key, value in gain_stats.items()},
-        })
-
-    with report_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    (PHOTO_DATASET_ROOT / "_photometric_config.json").write_text(
-        json.dumps(photometric_config(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-    corrected_count = sum(bool(row["corrected"]) for row in rows)
-    print(f"Source images        : {len(source_files)}")
-    print(f"Upper-bright images  : {len(reference_names)}")
-    print(f"Corrected images     : {corrected_count}")
-    print(f"Derived dataset      : {PHOTO_DATASET_ROOT}")
-    print(f"Horizon report       : {report_path}")
-    print("==========================================")
-    return {
-        "source_images": len(source_files),
-        "upper_bright_images": len(reference_names),
-        "corrected_images": corrected_count,
-        "report_path": str(report_path),
-    }
-
-
-# =============================================================================
-# 3DGRUT SOURCE PATCHES
-# =============================================================================
-
-
-def locate_3dgrut_root() -> Path:
-    here = Path(__file__).resolve().parent
-    for candidate in (here, here.parent):
-        if (
-            (candidate / "train.py").is_file()
-            and (candidate / "threedgrut" / "trainer.py").is_file()
-            and (candidate / "configs" / "apps" / "colmap_3dgut_mcmc_nht.yaml").is_file()
-        ):
-            return candidate
-    fail("Place this launcher in the root of the 3DGRUT repository, next to train.py.")
-
-
-def backup_once(path: Path, suffix: str) -> Path:
-    backup = path.with_name(path.name + suffix)
-    if not backup.exists():
-        shutil.copy2(path, backup)
-        print(f"[Patch] Backup created: {backup}")
-    return backup
-
-
-def replace_once(text: str, old: str, new: str, description: str) -> str:
-    count = text.count(old)
-    if count != 1:
-        fail(
-            f"Could not apply {description}: expected one source anchor, found {count}.\n"
-            "The checked-out 3DGRUT source may differ from the tested v2 commit."
-        )
-    return text.replace(old, new, 1)
-
-
-def patch_colmap_missing_rgb_filter(path: Path) -> None:
-    """Apply missing-RGB filtering and fix the upstream no-split index bug."""
-    backup = path.with_name(path.name + ".pre_hcm0204_rgb_filter.bak")
-    text = path.read_text(encoding="utf-8")
-
-    # The first launcher version already patched this checkout. Rebuild from
-    # the pristine backup so the v2 patch is deterministic and idempotent.
-    if DATASET_PATCH_MARKER in text:
-        if not backup.is_file():
-            fail(
-                "The old COLMAP patch is present but its pristine backup is "
-                f"missing:\n  {backup}\n"
-                "Run 'git checkout -- threedgrut/datasets/dataset_colmap.py' "
-                "and rerun this launcher."
-            )
-        print(f"[Patch] Restoring pristine COLMAP loader from: {backup}")
-        text = backup.read_text(encoding="utf-8")
-
-    if DATASET_NO_SPLIT_MARKER in text:
-        print("[Patch] COLMAP loader v2 is already present.")
-        return
-
-    reload_anchor = """        self.load_intrinsics_and_extrinsics()
-        frame_indices_before_split = self._filter_cameras()
-"""
-    reload_replacement = """        self.load_intrinsics_and_extrinsics()
-
-        # BEGIN HCM0204 MISSING RGB FILTER PATCH
-        _rgb_frame_indices = self._filter_missing_rgb_frames()
-        _camera_frame_indices = self._filter_cameras()
-        frame_indices_before_split = [
-            _rgb_frame_indices[index]
-            for index in _camera_frame_indices
-        ]
-        # END HCM0204 MISSING RGB FILTER PATCH
-"""
-    text = replace_once(
-        text,
-        reload_anchor,
-        reload_replacement,
-        "COLMAP reload filter v2",
-    )
-
-    helper_anchor = "    def _filter_cameras(self) -> list[int]:\n"
-    helper_code = r"""    # BEGIN HCM0204 MISSING RGB FILTER PATCH
-    def _filter_missing_rgb_frames(self) -> list[int]:
-        # Keep only registered COLMAP frames with an existing RGB file.
-        image_root = os.path.join(self.path, "images")
-        if not os.path.isdir(image_root):
-            raise ValueError(f"Image folder does not exist: {image_root}")
-
-        kept_extrinsics = []
-        kept_original_indices = []
-        dropped_names = []
-
-        for original_index, extr in enumerate(self.cam_extrinsics):
-            image_path = os.path.join(image_root, str(extr.name))
-            if os.path.isfile(image_path):
-                kept_extrinsics.append(extr)
-                kept_original_indices.append(original_index)
-            else:
-                dropped_names.append(str(extr.name))
-
-        original_count = len(self.cam_extrinsics)
-        self.cam_extrinsics = kept_extrinsics
-
-        logger.info(
-            f"[COLMAP] Train RGB filter: keeping {len(kept_extrinsics)}/"
-            f"{original_count} registered frames; dropping "
-            f"{len(dropped_names)} frames without RGB files."
-        )
-        if dropped_names:
-            logger.info(
-                "[COLMAP] Example dropped frames: "
-                + ", ".join(dropped_names[:5])
-            )
-        if not kept_extrinsics:
-            raise ValueError(
-                f"No registered COLMAP frame has a matching RGB file in "
-                f"{image_root}."
-            )
-
-        return kept_original_indices
-
-    # END HCM0204 MISSING RGB FILTER PATCH
-
-"""
-    text = replace_once(
-        text,
-        helper_anchor,
-        helper_code + helper_anchor,
-        "COLMAP missing-RGB helper",
-    )
-
-    # Upstream 3DGRUT uses np.where(indices)[0] for cam_extrinsics but direct
-    # indexing for poses/image_paths. With test_split_interval <= 0, indices is
-    # [0, 1, 2, ...], so np.where removes frame 0 and creates a 239-vs-240
-    # mismatch. Convert the no-split case to an all-True boolean mask.
-    split_anchor = """        indices = np.arange(self.n_frames)
-
-        # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
-        # If test_split_interval is non-positive, all images will be used for training and testing
-        if self.test_split_interval > 0:
-            if self.split == "train":
-                indices = np.mod(indices, self.test_split_interval) != 0
-            else:
-                indices = np.mod(indices, self.test_split_interval) == 0
-"""
-    split_replacement = """        # BEGIN HCM0204 NO-SPLIT INDEX PATCH
-        frame_numbers = np.arange(self.n_frames)
-
-        # If test_split_interval is positive, build the normal boolean split
-        # mask. If it is non-positive, use an all-True boolean mask so every
-        # per-frame container is indexed identically.
-        if self.test_split_interval > 0:
-            if self.split == "train":
-                indices = np.mod(frame_numbers, self.test_split_interval) != 0
-            else:
-                indices = np.mod(frame_numbers, self.test_split_interval) == 0
-        else:
-            indices = np.ones(self.n_frames, dtype=bool)
-        # END HCM0204 NO-SPLIT INDEX PATCH
-"""
-    text = replace_once(
-        text,
-        split_anchor,
-        split_replacement,
-        "COLMAP no-split index fix",
-    )
-
-    final_anchor = """        # Update the number of frames to only include the samples from the split
-        self.n_frames = self.poses.shape[0]
-
-        # Clear existing worker caches to force recreation with new intrinsics
-"""
-    final_replacement = """        # Update the number of frames to only include the samples from the split
-        self.n_frames = self.poses.shape[0]
-
-        # BEGIN HCM0204 FRAME STATE ASSERT PATCH
-        _frame_lengths = {
-            "n_frames": int(self.n_frames),
-            "cam_extrinsics": len(self.cam_extrinsics),
-            "poses": len(self.poses),
-            "image_paths": len(self.image_paths),
-            "mask_paths": len(self.mask_paths),
-            "camera_centers": len(self.camera_centers),
-        }
-        if len(set(_frame_lengths.values())) != 1:
-            raise RuntimeError(
-                "COLMAP per-frame state is inconsistent after filtering: "
-                f"{_frame_lengths}"
-            )
-        logger.info(
-            "[COLMAP] Final frame state synchronized: "
-            f"{_frame_lengths}"
-        )
-        # END HCM0204 FRAME STATE ASSERT PATCH
-
-        # Clear existing worker caches to force recreation with new intrinsics
-"""
-    text = replace_once(
-        text,
-        final_anchor,
-        final_replacement,
-        "COLMAP frame-state assertion",
-    )
-
-    path.write_text(text, encoding="utf-8")
-    py_compile.compile(str(path), doraise=True)
-    print(f"[Patch] Updated COLMAP loader to RGB/no-split patch v2: {path}")
-
-
-def patch_horizon_aware_loss(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
-    if HORIZON_PATCH_MARKER in text:
-        print("[Patch] Horizon-aware loss is already present.")
-        return
-
-    text = replace_once(text, "import os\n", "import csv\nimport os\n", "csv import")
-    text = replace_once(
-        text,
-        "import torch.nn as nn\n",
-        "import torch.nn as nn\nimport torch.nn.functional as F\n",
-        "torch functional import",
-    )
-
-    module_helpers = r'''
-
-# BEGIN HCM0204 HORIZON LOSS PATCH HELPERS
-
-def _horizon_normalize_name(name: str) -> str:
-    return str(name).replace("\\", "/").lstrip("./")
-
-
-def _horizon_luminance(rgb: torch.Tensor) -> torch.Tensor:
-    return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-
-
-def _horizon_sobel_magnitude(rgb: torch.Tensor) -> torch.Tensor:
-    luma = _horizon_luminance(rgb).unsqueeze(1)
-    kernel_x = torch.tensor(
-        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=rgb.device,
-        dtype=rgb.dtype,
-    ).view(1, 1, 3, 3) / 8.0
-    kernel_y = torch.tensor(
-        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
-        device=rgb.device,
-        dtype=rgb.dtype,
-    ).view(1, 1, 3, 3) / 8.0
-    gx = F.conv2d(luma, kernel_x, padding=1)
-    gy = F.conv2d(luma, kernel_y, padding=1)
-    return torch.sqrt(gx.square() + gy.square() + 1e-12).squeeze(1)
-
-# END HCM0204 HORIZON LOSS PATCH HELPERS
-'''
-    text = replace_once(
-        text,
-        "\nclass Trainer3DGRUT:\n",
-        module_helpers + "\nclass Trainer3DGRUT:\n",
-        "horizon module helpers",
-    )
-    text = replace_once(
-        text,
-        """        self.init_dataloaders(conf)\n        self.init_scene_extents(self.train_dataset)\n""",
-        """        self.init_dataloaders(conf)\n        self._init_horizon_aware_loss(conf)\n        self.init_scene_extents(self.train_dataset)\n""",
-        "horizon initialization",
-    )
-
-    trainer_methods = r'''    # BEGIN HCM0204 HORIZON LOSS PATCH
-    def _init_horizon_aware_loss(self, conf: DictConfig) -> None:
-        self._horizon_enabled = bool(
-            OmegaConf.select(conf, "loss.horizon_aware.enabled", default=False)
-        )
-        self._horizon_train_flags = None
-        if not self._horizon_enabled:
-            return
-
-        report_raw = str(
-            OmegaConf.select(conf, "loss.horizon_aware.report_path", default="") or ""
-        )
-        report_name = str(
-            OmegaConf.select(
-                conf,
-                "loss.horizon_aware.report_filename",
-                default="_photometric_report.csv",
-            )
-        )
-        report_path = Path(report_raw) if report_raw else Path(conf.path) / report_name
-        report_path = report_path.expanduser().resolve()
-        if not report_path.is_file():
-            raise FileNotFoundError(f"Horizon report does not exist: {report_path}")
-
-        flags_by_name = {}
-        with report_path.open("r", encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                name = _horizon_normalize_name(row.get("image_name", ""))
-                raw = str(row.get("upper_bright", "")).strip().lower()
-                flags_by_name[name] = raw in {"1", "true", "yes", "y"}
-
-        image_root = (Path(conf.path) / self.train_dataset.get_images_folder()).resolve()
-        flags = []
-        missing = 0
-        for image_path_raw in self.train_dataset.image_paths:
-            image_path = Path(str(image_path_raw)).resolve()
-            try:
-                name = image_path.relative_to(image_root).as_posix()
-            except ValueError:
-                name = image_path.name
-            name = _horizon_normalize_name(name)
-            missing += name not in flags_by_name
-            flags.append(bool(flags_by_name.get(name, False)))
-
-        self._horizon_train_flags = torch.tensor(
-            flags, dtype=torch.bool, device=self.device
-        )
-        logger.info(
-            f"[HorizonLoss] Active train frames: {sum(flags)}/{len(flags)}; "
-            f"missing report rows: {missing}; report={report_path}"
+import py_compile
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+marker = "# BEGIN TCNN JIT CONTROL PATCH"
+
+if marker not in text:
+    if "import tinycudann as tcnn\nimport torch\n" in text:
+        text = text.replace(
+            "import tinycudann as tcnn\nimport torch\n",
+            "import os\n\nimport tinycudann as tcnn\nimport torch\n",
+            1,
         )
 
-    def _horizon_aware_rgb_loss(
-        self,
-        rgb_pred: torch.Tensor,
-        rgb_gt: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        active: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        if not active:
-            zero = rgb_pred.sum() * 0.0
-            return torch.abs(rgb_pred - rgb_gt).mean(), zero, {}
-
-        cfg = self.conf.loss.horizon_aware
-        batch, height, width, _ = rgb_gt.shape
-        gt_edges = _horizon_sobel_magnitude(rgb_gt).detach()
-        gt_luma = _horizon_luminance(rgb_gt).detach()
-        y = torch.linspace(
-            0.0, 1.0, height, device=rgb_gt.device, dtype=rgb_gt.dtype
-        ).view(1, height, 1)
-
-        top = y <= float(cfg.top_region_end)
-        sky_region = y <= float(cfg.sky_interior_end)
-        sky = sky_region & (gt_luma >= float(cfg.sky_luma_min)) & (
-            gt_edges <= float(cfg.sky_edge_max)
-        )
-        band = top & (gt_edges >= float(cfg.edge_threshold))
-        foreground = top & ~sky & ~band
-
-        weights = torch.ones(
-            (batch, height, width), device=rgb_gt.device, dtype=rgb_gt.dtype
-        )
-        weights = torch.where(
-            foreground,
-            torch.as_tensor(float(cfg.top_foreground_weight), device=rgb_gt.device, dtype=rgb_gt.dtype),
-            weights,
-        )
-        weights = torch.where(
-            sky,
-            torch.as_tensor(float(cfg.sky_weight), device=rgb_gt.device, dtype=rgb_gt.dtype),
-            weights,
-        )
-        weights = torch.where(
-            band,
-            torch.as_tensor(float(cfg.band_weight), device=rgb_gt.device, dtype=rgb_gt.dtype),
-            weights,
-        )
-
-        valid = torch.ones_like(weights, dtype=torch.bool)
-        if mask is not None:
-            valid = mask[..., 0] > 0.5
-            weights = weights * valid.to(weights.dtype)
-
-        pixel_l1 = torch.abs(rgb_pred - rgb_gt).mean(dim=-1)
-        weighted_l1 = (pixel_l1 * weights).sum() / weights.sum().clamp_min(1.0)
-
-        pred_edges = _horizon_sobel_magnitude(rgb_pred)
-        edge_mask = band & valid
-        denominator = edge_mask.to(rgb_gt.dtype).sum()
-        if bool(denominator.detach().item() > 0):
-            edge_loss = (
-                torch.abs(pred_edges - gt_edges) * edge_mask.to(rgb_gt.dtype)
-            ).sum() / denominator.clamp_min(1.0)
-        else:
-            edge_loss = rgb_pred.sum() * 0.0
-
-        total_pixels = torch.as_tensor(
-            batch * height * width, device=rgb_gt.device, dtype=rgb_gt.dtype
-        )
-        stats = {
-            "sky_ratio": sky.to(rgb_gt.dtype).sum() / total_pixels,
-            "band_ratio": band.to(rgb_gt.dtype).sum() / total_pixels,
-            "top_foreground_ratio": foreground.to(rgb_gt.dtype).sum() / total_pixels,
-            "mean_weight": weights.sum() / valid.to(rgb_gt.dtype).sum().clamp_min(1.0),
-        }
-        return weighted_l1, edge_loss, stats
-
-    # END HCM0204 HORIZON LOSS PATCH
-
-'''
-    text = replace_once(
-        text,
-        "    def init_dataloaders(self, conf: DictConfig):\n",
-        trainer_methods + "    def init_dataloaders(self, conf: DictConfig):\n",
-        "horizon trainer methods",
-    )
-
-    original_l1 = """        # L1 loss\n        loss_l1 = torch.zeros(1, device=self.device)\n        lambda_l1 = 0.0\n        if self.conf.loss.use_l1:\n            with torch.cuda.nvtx.range(f\"loss-l1\"):\n                loss_l1 = torch.abs(rgb_pred - rgb_gt).mean()\n                lambda_l1 = self.conf.loss.lambda_l1\n"""
-    replacement_l1 = """        # L1 loss\n        loss_l1 = torch.zeros(1, device=self.device)\n        loss_horizon_edge = torch.zeros(1, device=self.device)\n        lambda_l1 = 0.0\n        lambda_horizon_edge = 0.0\n        horizon_stats = {}\n        if self.conf.loss.use_l1:\n            with torch.cuda.nvtx.range(f\"loss-l1\"):\n                use_horizon = (\n                    self._horizon_enabled\n                    and torch.is_grad_enabled()\n                    and self._horizon_train_flags is not None\n                )\n                active_horizon = False\n                if use_horizon:\n                    frame_idx = int(gpu_batch.frame_idx)\n                    if 0 <= frame_idx < len(self._horizon_train_flags):\n                        active_horizon = bool(self._horizon_train_flags[frame_idx].item())\n                    loss_l1, loss_horizon_edge, horizon_stats = self._horizon_aware_rgb_loss(\n                        rgb_pred=rgb_pred,\n                        rgb_gt=rgb_gt,\n                        mask=mask,\n                        active=active_horizon,\n                    )\n                    if active_horizon:\n                        lambda_horizon_edge = float(\n                            self.conf.loss.horizon_aware.edge_loss_weight\n                        )\n                else:\n                    loss_l1 = torch.abs(rgb_pred - rgb_gt).mean()\n                lambda_l1 = self.conf.loss.lambda_l1\n"""
-    text = replace_once(text, original_l1, replacement_l1, "horizon weighted L1")
-
-    original_total = """        # Total loss\n        loss = lambda_l1 * loss_l1 + lambda_ssim * loss_ssim + lambda_opacity * loss_opacity + lambda_scale * loss_scale\n        return dict(\n            total_loss=loss,\n            l1_loss=lambda_l1 * loss_l1,\n            l2_loss=lambda_l2 * loss_l2,\n            ssim_loss=lambda_ssim * loss_ssim,\n            opacity_loss=lambda_opacity * loss_opacity,\n            scale_loss=lambda_scale * loss_scale,\n        )\n"""
-    replacement_total = """        # Total loss\n        loss = (\n            lambda_l1 * loss_l1\n            + lambda_ssim * loss_ssim\n            + lambda_opacity * loss_opacity\n            + lambda_scale * loss_scale\n            + lambda_horizon_edge * loss_horizon_edge\n        )\n        result = dict(\n            total_loss=loss,\n            l1_loss=lambda_l1 * loss_l1,\n            l2_loss=lambda_l2 * loss_l2,\n            ssim_loss=lambda_ssim * loss_ssim,\n            opacity_loss=lambda_opacity * loss_opacity,\n            scale_loss=lambda_scale * loss_scale,\n            horizon_edge_loss=lambda_horizon_edge * loss_horizon_edge,\n        )\n        for name, value in horizon_stats.items():\n            result[f\"horizon_{name}\"] = value\n        return result\n"""
-    text = replace_once(text, original_total, replacement_total, "horizon total loss")
-
-    log_anchor = """            if self.post_processing is not None and \"post_processing_reg_loss\" in batch_metrics[\"losses\"]:\n"""
-    log_replacement = """            if \"horizon_edge_loss\" in batch_metrics[\"losses\"]:\n                writer.add_scalar(\n                    \"loss/horizon_edge/train\",\n                    batch_metrics[\"losses\"][\"horizon_edge_loss\"],\n                    global_step,\n                )\n                for horizon_name in (\n                    \"horizon_sky_ratio\",\n                    \"horizon_band_ratio\",\n                    \"horizon_top_foreground_ratio\",\n                    \"horizon_mean_weight\",\n                ):\n                    if horizon_name in batch_metrics[\"losses\"]:\n                        writer.add_scalar(\n                            f\"loss/{horizon_name}/train\",\n                            batch_metrics[\"losses\"][horizon_name],\n                            global_step,\n                        )\n            if self.post_processing is not None and \"post_processing_reg_loss\" in batch_metrics[\"losses\"]:\n"""
-    text = replace_once(text, log_anchor, log_replacement, "horizon TensorBoard logging")
-
-    backup_once(path, ".pre_hcm0204_horizon.bak")
-    path.write_text(text, encoding="utf-8")
-    py_compile.compile(str(path), doraise=True)
-    print(f"[Patch] Updated: {path}")
-
-
-
-def patch_save_checkpoint_on_interrupt(path: Path) -> None:
-    """Make Ctrl+C save ckpt_last.pt and return a non-zero exit code."""
-    text = path.read_text(encoding="utf-8")
-    if INTERRUPT_PATCH_MARKER in text:
-        print("[Patch] Save-on-interrupt support is already present.")
-        return
-
-    anchor = """    trainer = Trainer3DGRUT(conf)
-    try:
-        trainer.run_training()
-    except KeyboardInterrupt:
-        logger.warning("Training interrupted by user.")
-"""
-    replacement = """    trainer = Trainer3DGRUT(conf)
-    try:
-        trainer.run_training()
-    except KeyboardInterrupt:
-        logger.warning("Training interrupted by user.")
-        # BEGIN SAVE CHECKPOINT ON INTERRUPT PATCH
-        try:
-            trainer.save_checkpoint(last_checkpoint=True)
-            logger.warning(
-                f"Interrupt checkpoint saved at global step {trainer.global_step}. "
-                "Run the launcher again to resume automatically."
-            )
-        except Exception as checkpoint_error:
-            logger.error(
-                f"Could not save interrupt checkpoint: {checkpoint_error}"
-            )
-        raise
-        # END SAVE CHECKPOINT ON INTERRUPT PATCH
-"""
-    text = replace_once(
-        text,
-        anchor,
-        replacement,
-        "save checkpoint on KeyboardInterrupt",
-    )
-    backup_once(path, ".pre_interrupt_checkpoint.bak")
-    path.write_text(text, encoding="utf-8")
-    py_compile.compile(str(path), doraise=True)
-    print(f"[Patch] Ctrl+C checkpoint saving enabled: {path}")
-
-
-def patch_tcnn_jit_control(path: Path) -> None:
-    """Allow TCNN_JIT_FUSION=0 to skip a known-failing RTC JIT attempt."""
-    text = path.read_text(encoding="utf-8")
-    if TCNN_JIT_PATCH_MARKER in text:
-        print("[Patch] tiny-cuda-nn JIT control is already present.")
-        return
-
-    text = replace_once(
-        text,
-        "import tinycudann as tcnn\nimport torch\n",
-        "import os\n\nimport tinycudann as tcnn\nimport torch\n",
-        "feature decoder os import",
-    )
-
-    anchor = """        if hasattr(tcnn, "supports_jit_fusion"):
+    old = """        if hasattr(tcnn, "supports_jit_fusion"):
             self.network.jit_fusion = tcnn.supports_jit_fusion()
 """
-    replacement = """        # BEGIN TCNN JIT CONTROL PATCH
+    new = """        # BEGIN TCNN JIT CONTROL PATCH
         if hasattr(tcnn, "supports_jit_fusion"):
             raw_jit = os.environ.get("TCNN_JIT_FUSION", "0").strip().lower()
             requested_jit = raw_jit in {"1", "true", "yes", "y", "on"}
@@ -1562,339 +389,995 @@ def patch_tcnn_jit_control(path: Path) -> None:
             )
         # END TCNN JIT CONTROL PATCH
 """
-    text = replace_once(
-        text,
-        anchor,
-        replacement,
-        "tiny-cuda-nn JIT environment control",
-    )
-    backup_once(path, ".pre_tcnn_jit_control.bak")
+    if old not in text:
+        raise RuntimeError(
+            "Could not patch tiny-cuda-nn JIT control; source anchor changed."
+        )
+    backup = path.with_name(path.name + ".pre_render_tcnn_jit.bak")
+    if not backup.exists():
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    text = text.replace(old, new, 1)
     path.write_text(text, encoding="utf-8")
     py_compile.compile(str(path), doraise=True)
-    print(
-        f"[Patch] tiny-cuda-nn JIT controlled by TCNN_JIT_FUSION="
-        f"{int(TCNN_JIT_FUSION)}: {path}"
-    )
+    print(f"[Patch] tiny-cuda-nn JIT control applied: {path}")
+else:
+    print("[Patch] tiny-cuda-nn JIT control already present.")
+PYPATCH
+}
+
+write_embedded_renderer() {
+    RENDER_LAUNCHER="$REPO_DIR/render_3dgrut_v2_embedded.py"
+    cat > "$RENDER_LAUNCHER" <<'__RENDER_3DGRUT_V2_PY__'
+#!/usr/bin/env python3
+"""
+Render AI Race test_poses.csv from a native 3DGRUT v2 3DGUT-MCMC-NHT
+checkpoint and evaluate with the AI Race score.
+
+Features:
+- Auto-discovers the latest run manifest produced by train_hcm0204_3dgrut_v2.py.
+- Supports explicit intermediate checkpoints (30k, 32.5k, 35k).
+- Builds native OpenCV/SIMPLE_RADIAL camera rays from COLMAP cameras.bin.
+- Loads NHT FeatureDecoder and applies EMA weights.
+- Loads PPISP automatically when present in the checkpoint.
+- Writes checkpoint-specific render folders to prevent stale-image reuse.
+- Computes PSNR, SSIM, LPIPS-VGG/Alex, MSE, MAE and the official score.
+
+Place this file in the root of nv-tlabs/3dgrut next to render.py.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import statistics
+import time
+from pathlib import Path
+from typing import Any, NoReturn
+
+import ncore.sensors
+import numpy as np
+import torch
+from ncore.data import OpenCVPinholeCameraModelParameters, ShutterType
+from PIL import Image
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from tqdm import tqdm
+
+from threedgrut.datasets.protocols import Batch
+from threedgrut.datasets.utils import create_pixel_coords, read_colmap_intrinsics_binary
+from threedgrut.model.feature_decoder import FeatureDecoder
+from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.utils.render import apply_background, apply_feature_decoder, apply_post_processing
 
 
 # =============================================================================
-# LAUNCH
+# USER CONFIGURATION
+# =============================================================================
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_optional_int(name: str, default: int | None = None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return int(raw)
+
+
+SCENE_NAME = os.environ.get("SCENE_NAME", "HCM0181")
+SCRIPT_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(SCRIPT_ROOT / "data"))).expanduser().resolve()
+ORIGINAL_SCENE_ROOT = Path(
+    os.environ.get("SCENE_ROOT", str(DATA_ROOT / SCENE_NAME))
+).expanduser().resolve()
+TEST_ROOT = Path(
+    os.environ.get("TEST_ROOT", str(ORIGINAL_SCENE_ROOT / "test"))
+).expanduser().resolve()
+TEST_CSV_PATH = Path(
+    os.environ.get("TEST_CSV_PATH", str(TEST_ROOT / "test_poses.csv"))
+).expanduser().resolve()
+GT_DIR = Path(
+    os.environ.get("GT_DIR", str(TEST_ROOT / "images"))
+).expanduser().resolve()
+CAMERAS_BIN_PATH = Path(
+    os.environ.get(
+        "CAMERAS_BIN_PATH",
+        str(ORIGINAL_SCENE_ROOT / "sparse" / "0" / "cameras.bin"),
+    )
+).expanduser().resolve()
+
+APPEARANCE_MODE = os.environ.get("APPEARANCE_MODE", "native_distortion")
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "35000"))
+CAP_MAX = int(os.environ.get("CAP_MAX", "2000000"))
+NHT_FEATURE_DIM = int(os.environ.get("NHT_FEATURE_DIM", "48"))
+RUN_NAME = os.environ.get(
+    "RUN_NAME",
+    (
+        f"{SCENE_NAME}_3dgrut_v2_3dgut_mcmc_nht_"
+        f"{APPEARANCE_MODE}_{MAX_STEPS // 1000}k_"
+        f"{CAP_MAX // 1_000_000}m_fd{NHT_FEATURE_DIM}"
+    ),
+)
+EXPERIMENT_DIR = Path(
+    os.environ.get("EXPERIMENT_DIR", str(SCRIPT_ROOT / "runs" / RUN_NAME))
+).expanduser().resolve()
+
+# CHECKPOINT_STEP accepts: last/latest/none or an exact integer step.
+_checkpoint_step_raw = os.environ.get("CHECKPOINT_STEP", "last").strip().lower()
+CHECKPOINT_STEP: int | None = (
+    None
+    if _checkpoint_step_raw in {"", "last", "latest", "none"}
+    else int(_checkpoint_step_raw)
+)
+_checkpoint_path_raw = os.environ.get("CHECKPOINT_PATH", "").strip()
+CHECKPOINT_PATH: Path | None = (
+    Path(_checkpoint_path_raw).expanduser().resolve()
+    if _checkpoint_path_raw
+    else None
+)
+
+# CUDA_VISIBLE_DEVICES selects the physical GPU in the shell. Inside this
+# process the selected device is logical cuda:0.
+GPU_ID = int(os.environ.get("RENDER_LOGICAL_GPU_ID", "0"))
+CAMERA_ID = env_optional_int("CAMERA_ID")
+USE_NATIVE_DISTORTION = env_bool("USE_NATIVE_DISTORTION", True)
+USE_FEATURE_DECODER_EMA = env_bool("USE_FEATURE_DECODER_EMA", True)
+
+LPIPS_NET = os.environ.get("LPIPS_NET", "vgg").strip().lower()
+PSNR_MAX = float(os.environ.get("PSNR_MAX", "40.0"))
+BACKGROUND_OVERRIDE: tuple[float, float, float] | None = None
+
+OVERWRITE = env_bool("OVERWRITE_RENDER", False)
+SAVE_ALPHA = env_bool("SAVE_ALPHA", False)
+MAX_IMAGES = env_optional_int("MAX_IMAGES")
+_force_extension_raw = os.environ.get("FORCE_OUTPUT_EXTENSION", "").strip()
+FORCE_OUTPUT_EXTENSION: str | None = _force_extension_raw or None
+JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "95"))
+PNG_COMPRESS_LEVEL = int(os.environ.get("PNG_COMPRESS_LEVEL", "3"))
+RESIZE_PREDICTION_TO_GT = env_bool("RESIZE_PREDICTION_TO_GT", False)
+CONTINUE_ON_EVAL_ERROR = env_bool("CONTINUE_ON_EVAL_ERROR", True)
+
+_eval_raw = os.environ.get("ENABLE_EVALUATION", "auto").strip().lower()
+ENABLE_EVALUATION = (
+    GT_DIR.is_dir()
+    if _eval_raw == "auto"
+    else _eval_raw in {"1", "true", "yes", "y", "on"}
+)
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+# =============================================================================
+# HELPERS
 # =============================================================================
 
 
-def git_revision(root: Path) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
+def fail(message: str) -> NoReturn:
+    raise RuntimeError(message)
 
 
-def newest_checkpoint(experiment_dir: Path) -> Path | None:
+def locate_3dgrut_root() -> Path:
+    here = Path(__file__).resolve().parent
+    for candidate in (here, here.parent):
+        if (
+            (candidate / "render.py").is_file()
+            and (candidate / "threedgrut" / "render.py").is_file()
+            and (candidate / "threedgrut" / "model" / "model.py").is_file()
+        ):
+            return candidate
+    fail("Place this renderer in the root of the 3DGRUT repository.")
+
+
+def checkpoint_step_from_path(path: Path) -> int:
+    match = re.search(r"ckpt_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def checkpoint_run_dir(checkpoint: Path) -> Path:
+    checkpoint = checkpoint.resolve()
+    if checkpoint.parent.name.startswith("ours_"):
+        return checkpoint.parent.parent
+    return checkpoint.parent
+
+
+def checkpoint_candidates(experiment_dir: Path) -> list[Path]:
     if not experiment_dir.is_dir():
-        return None
-
+        return []
     candidates = {
         *experiment_dir.rglob("ckpt_last.pt"),
         *experiment_dir.rglob("ckpt_*.pt"),
     }
-    candidates = {
-        path for path in candidates
-        if path.is_file() and path.stat().st_size > 0
+    return sorted(
+        (
+            path.resolve()
+            for path in candidates
+            if path.is_file() and path.stat().st_size > 0
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def resolve_checkpoint() -> tuple[Path, Path]:
+    if CHECKPOINT_PATH is not None:
+        if not CHECKPOINT_PATH.is_file():
+            fail(f"Explicit checkpoint does not exist: {CHECKPOINT_PATH}")
+        return CHECKPOINT_PATH, checkpoint_run_dir(CHECKPOINT_PATH)
+
+    candidates = checkpoint_candidates(EXPERIMENT_DIR)
+    if not candidates:
+        fail(
+            f"No checkpoint was found under: {EXPERIMENT_DIR}\n"
+            "Finish or interrupt training after enabling save-on-Ctrl+C, "
+            "or provide CHECKPOINT_PATH explicitly."
+        )
+
+    if CHECKPOINT_STEP is None:
+        last_candidates = [path for path in candidates if path.name == "ckpt_last.pt"]
+        checkpoint = last_candidates[0] if last_candidates else candidates[0]
+        return checkpoint, checkpoint_run_dir(checkpoint)
+
+    exact_name = f"ckpt_{CHECKPOINT_STEP}.pt"
+    exact_candidates = [path for path in candidates if path.name == exact_name]
+    if not exact_candidates:
+        available = sorted(
+            {
+                checkpoint_step_from_path(path)
+                for path in candidates
+                if checkpoint_step_from_path(path) >= 0
+            }
+        )
+        fail(
+            f"Checkpoint step {CHECKPOINT_STEP} was not found under: "
+            f"{EXPERIMENT_DIR}\nAvailable exact steps: {available}; "
+            f"last checkpoints: {sum(path.name == 'ckpt_last.pt' for path in candidates)}"
+        )
+
+    checkpoint = exact_candidates[0]
+    return checkpoint, checkpoint_run_dir(checkpoint)
+
+
+def normalize_header(name: str) -> str:
+    return name.strip().lower().replace(" ", "_")
+
+
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "image_name": ("image_name", "name", "filename", "file_name", "image"),
+    "qw": ("qw", "q_w"), "qx": ("qx", "q_x"), "qy": ("qy", "q_y"), "qz": ("qz", "q_z"),
+    "tx": ("tx", "t_x"), "ty": ("ty", "t_y"), "tz": ("tz", "t_z"),
+    "fx": ("fx", "f_x"), "fy": ("fy", "f_y"),
+    "cx": ("cx", "c_x"), "cy": ("cy", "c_y"),
+    "width": ("width", "w", "image_width"),
+    "height": ("height", "h", "image_height"),
+}
+
+
+def resolve_column(fieldnames: list[str], logical_name: str) -> str:
+    mapping = {normalize_header(field): field for field in fieldnames}
+    for alias in COLUMN_ALIASES[logical_name]:
+        if alias in mapping:
+            return mapping[alias]
+    fail(f"Missing CSV column {logical_name!r}; available columns: {fieldnames}")
+
+
+def parse_float(row: dict[str, str], column: str, row_number: int) -> float:
+    try:
+        value = float(row.get(column, ""))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Row {row_number}: invalid value in {column!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"Row {row_number}: non-finite value in {column!r}")
+    return value
+
+
+def parse_int(row: dict[str, str], column: str, row_number: int) -> int:
+    value = parse_float(row, column, row_number)
+    rounded = int(round(value))
+    if rounded <= 0 or abs(value - rounded) > 1e-6:
+        raise ValueError(f"Row {row_number}: {column!r} must be a positive integer")
+    return rounded
+
+
+def read_test_poses(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        fail(f"test_poses.csv does not exist: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            fail(f"CSV has no header: {path}")
+        columns = {key: resolve_column(list(reader.fieldnames), key) for key in COLUMN_ALIASES}
+        records: list[dict[str, Any]] = []
+        for row_number, row in enumerate(reader, start=2):
+            image_name = str(row.get(columns["image_name"], "")).strip()
+            if not image_name:
+                raise ValueError(f"Row {row_number}: empty image_name")
+            record: dict[str, Any] = {
+                "image_name": image_name,
+                "width": parse_int(row, columns["width"], row_number),
+                "height": parse_int(row, columns["height"], row_number),
+            }
+            for key in ("qw", "qx", "qy", "qz", "tx", "ty", "tz", "fx", "fy", "cx", "cy"):
+                record[key] = parse_float(row, columns[key], row_number)
+            records.append(record)
+    if MAX_IMAGES is not None:
+        records = records[:MAX_IMAGES]
+    if not records:
+        fail(f"No test poses found in: {path}")
+    return records
+
+
+def quaternion_to_rotation(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    q = np.asarray([qw, qx, qy, qz], dtype=np.float64)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-12:
+        fail("Encountered a zero-length quaternion.")
+    qw, qx, qy, qz = q / norm
+    return np.asarray([
+        [1 - 2 * (qy*qy + qz*qz), 2 * (qx*qy - qz*qw), 2 * (qx*qz + qy*qw)],
+        [2 * (qx*qy + qz*qw), 1 - 2 * (qx*qx + qz*qz), 2 * (qy*qz - qx*qw)],
+        [2 * (qx*qz - qy*qw), 2 * (qy*qz + qx*qw), 1 - 2 * (qx*qx + qy*qy)],
+    ], dtype=np.float32)
+
+
+def build_c2w(record: dict[str, Any]) -> np.ndarray:
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :3] = quaternion_to_rotation(record["qw"], record["qx"], record["qy"], record["qz"])
+    w2c[:3, 3] = np.asarray([record["tx"], record["ty"], record["tz"]], dtype=np.float32)
+    return np.linalg.inv(w2c).astype(np.float32)
+
+
+# =============================================================================
+# NATIVE CAMERA MODEL
+# =============================================================================
+
+
+def select_colmap_camera() -> Any:
+    cameras = read_colmap_intrinsics_binary(str(CAMERAS_BIN_PATH))
+    if CAMERA_ID is not None:
+        if CAMERA_ID not in cameras:
+            fail(f"CAMERA_ID={CAMERA_ID} not found; available IDs: {sorted(cameras)}")
+        return cameras[CAMERA_ID]
+    if len(cameras) != 1:
+        fail(f"Expected one COLMAP camera, found {len(cameras)}. Set CAMERA_ID explicitly.")
+    return next(iter(cameras.values()))
+
+
+def distortion_from_colmap(camera: Any) -> dict[str, np.ndarray | str]:
+    model = str(camera.model)
+    params = np.asarray(camera.params, dtype=np.float32)
+    radial = np.zeros(6, dtype=np.float32)
+    tangential = np.zeros(2, dtype=np.float32)
+    thin_prism = np.zeros(4, dtype=np.float32)
+
+    if not USE_NATIVE_DISTORTION or model in {"SIMPLE_PINHOLE", "PINHOLE"}:
+        pass
+    elif model == "SIMPLE_RADIAL":
+        radial[0] = params[3]
+    elif model == "RADIAL":
+        radial[:2] = params[3:5]
+    elif model == "OPENCV":
+        radial[:2] = params[4:6]
+        tangential[:] = params[6:8]
+    elif model == "FULL_OPENCV":
+        radial[:] = params[[4, 5, 8, 9, 10, 11]]
+        tangential[:] = params[6:8]
+    else:
+        fail(
+            f"Custom CSV renderer currently supports pinhole/OpenCV distortion, got {model}. "
+            "Use the official dataset renderer for fisheye cameras."
+        )
+    return {
+        "model": model,
+        "radial": radial,
+        "tangential": tangential,
+        "thin_prism": thin_prism,
     }
-    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def camera_cache_key(record: dict[str, Any], distortion: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record["width"], record["height"],
+        round(record["fx"], 10), round(record["fy"], 10),
+        round(record["cx"], 10), round(record["cy"], 10),
+        tuple(np.asarray(distortion["radial"]).tolist()),
+        tuple(np.asarray(distortion["tangential"]).tolist()),
+        tuple(np.asarray(distortion["thin_prism"]).tolist()),
+    )
+
+
+def build_native_camera_tensors(
+    record: dict[str, Any],
+    distortion: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], torch.Tensor]:
+    width = int(record["width"])
+    height = int(record["height"])
+    params = OpenCVPinholeCameraModelParameters(
+        resolution=np.array([width, height], dtype=np.uint64),
+        shutter_type=ShutterType.GLOBAL,
+        principal_point=np.array([record["cx"], record["cy"]], dtype=np.float32),
+        focal_length=np.array([record["fx"], record["fy"]], dtype=np.float32),
+        radial_coeffs=np.asarray(distortion["radial"], dtype=np.float32),
+        tangential_coeffs=np.asarray(distortion["tangential"], dtype=np.float32),
+        thin_prism_coeffs=np.asarray(distortion["thin_prism"], dtype=np.float32),
+    )
+    camera_model = ncore.sensors.CameraModel.from_parameters(
+        params, device="cpu", dtype=torch.float32
+    )
+    u = np.tile(np.arange(width), height)
+    v = np.arange(height).repeat(width)
+    int_pixels = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
+    image_points = camera_model.pixels_to_image_points(int_pixels)
+    rays_dir = camera_model.image_points_to_camera_rays(image_points)
+    rays_ori = torch.zeros_like(rays_dir)
+    rays_ori = rays_ori.to(torch.float32).reshape(1, height, width, 3).to(device)
+    rays_dir = rays_dir.to(torch.float32).reshape(1, height, width, 3).to(device)
+    pixels = create_pixel_coords(width, height, device=device)
+    return rays_ori, rays_dir, params.to_dict(), pixels
+
+
+def make_batch(
+    record: dict[str, Any],
+    distortion: dict[str, Any],
+    cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, dict[str, Any], torch.Tensor]],
+    device: torch.device,
+) -> Batch:
+    key = camera_cache_key(record, distortion)
+    if key not in cache:
+        cache[key] = build_native_camera_tensors(record, distortion, device)
+    rays_ori, rays_dir, params_dict, pixels = cache[key]
+    c2w = torch.from_numpy(build_c2w(record)).to(device=device, dtype=torch.float32).unsqueeze(0)
+    return Batch(
+        rays_ori=rays_ori,
+        rays_dir=rays_dir,
+        T_to_world=c2w,
+        intrinsics_OpenCVPinholeCameraModelParameters=params_dict,
+        camera_idx=0,
+        frame_idx=-1,
+        pixel_coords=pixels,
+    )
+
+
+# =============================================================================
+# CHECKPOINT MODEL LOADING
+# =============================================================================
+
+
+def load_post_processing(checkpoint: dict[str, Any], conf: Any, device: torch.device) -> Any | None:
+    if "post_processing" not in checkpoint:
+        return None
+    method = conf.post_processing.method
+    if method == "linear-to-srgb":
+        from threedgrut.utils.post_processing_linear_to_srgb import LinearToSrgbPostProcessing
+        module = LinearToSrgbPostProcessing()
+        module.load_state_dict(checkpoint["post_processing"]["module"])
+        return module.to(device).eval()
+    if method == "ppisp":
+        from ppisp import PPISP, PPISPConfig
+        use_controller = conf.post_processing.get("use_controller", True)
+        distill_steps = conf.post_processing.get("n_distillation_steps", 5000)
+        if use_controller and distill_steps > 0:
+            activation_ratio = (conf.n_iterations - distill_steps) / conf.n_iterations
+            controller_distillation = True
+        elif use_controller:
+            activation_ratio = 0.8
+            controller_distillation = False
+        else:
+            activation_ratio = 0.0
+            controller_distillation = False
+        pp_config = PPISPConfig(
+            use_controller=use_controller,
+            controller_distillation=controller_distillation,
+            controller_activation_ratio=activation_ratio,
+        )
+        return PPISP.from_state_dict(
+            checkpoint["post_processing"]["module"], config=pp_config
+        ).to(device).eval()
+    return None
+
+
+def load_feature_decoder(
+    checkpoint: dict[str, Any],
+    conf: Any,
+    model: MixtureOfGaussians,
+    device: torch.device,
+) -> tuple[FeatureDecoder | None, str]:
+    if "feature_decoder" not in checkpoint:
+        return None, "none"
+    dec = conf.model.nht_decoder
+    decoder = FeatureDecoder(
+        ray_feature_dim=model.ray_feature_dim,
+        hidden_dim=dec.hidden_dim,
+        num_layers=getattr(dec, "num_layers", 4),
+        dir_encoding=getattr(dec, "dir_encoding", "SphericalHarmonics"),
+        dir_encoding_degree=getattr(dec, "dir_encoding_degree", 3),
+        sh_scale=getattr(dec, "sh_scale", 1.0),
+        output_activation=getattr(dec, "output_activation", "Sigmoid"),
+        ema_decay=getattr(dec, "ema_decay", 0.0),
+        ema_start_step=getattr(dec, "ema_start_step", 0),
+        unpremultiply_alpha=getattr(dec, "unpremultiply_alpha", False),
+    ).to(device)
+    decoder.load_state_dict(checkpoint["feature_decoder"]["module"])
+    state_name = "module"
+    ema_state = checkpoint["feature_decoder"].get("ema")
+    if USE_FEATURE_DECODER_EMA and ema_state:
+        decoder.load_ema_state_dict(ema_state)
+        decoder.apply_ema_shadow()
+        state_name = "ema"
+    decoder.eval()
+    return decoder, state_name
+
+
+def load_model(
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[MixtureOfGaussians, FeatureDecoder | None, Any | None, Any, dict[str, Any]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "config" not in checkpoint:
+        fail(f"Checkpoint has no config: {checkpoint_path}")
+    conf = checkpoint["config"]
+    if str(conf.render.method) != "3dgut":
+        fail(f"Expected a 3DGUT checkpoint, got render.method={conf.render.method}")
+    model = MixtureOfGaussians(conf)
+    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+    model.build_acc()
+    model.eval()
+    decoder, decoder_state = load_feature_decoder(checkpoint, conf, model, device)
+    post_processing = load_post_processing(checkpoint, conf, device)
+    meta = {
+        "global_step": int(checkpoint.get("global_step", checkpoint_step_from_path(checkpoint_path))),
+        "num_gaussians": int(model.num_gaussians),
+        "feature_type": str(checkpoint.get("feature_type", "unknown")),
+        "particle_feature_dim": int(checkpoint.get("particle_feature_dim", -1)),
+        "ray_feature_dim": int(checkpoint.get("ray_feature_dim", -1)),
+        "decoder_state": decoder_state,
+        "post_processing": str(conf.post_processing.method),
+    }
+    return model, decoder, post_processing, conf, meta
+
+
+# =============================================================================
+# IMAGE I/O AND METRICS
+# =============================================================================
+
+
+def output_path_for(output_dir: Path, image_name: str) -> Path:
+    relative = Path(image_name)
+    if relative.is_absolute() or ".." in relative.parts:
+        relative = Path(relative.name)
+    if FORCE_OUTPUT_EXTENSION:
+        extension = FORCE_OUTPUT_EXTENSION if FORCE_OUTPUT_EXTENSION.startswith(".") else "." + FORCE_OUTPUT_EXTENSION
+        relative = relative.with_suffix(extension)
+    elif relative.suffix == "":
+        relative = relative.with_suffix(".png")
+    return output_dir / relative
+
+
+def save_rgb(rgb: np.ndarray, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(rgb, mode="RGB")
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        image.save(path, format="JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=False)
+        return path
+    if suffix == ".png":
+        image.save(path, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
+        return path
+    fallback = path.with_suffix(".png")
+    image.save(fallback, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
+    return fallback
+
+
+def find_gt_path(image_name: str) -> Path | None:
+    direct = GT_DIR / image_name
+    if direct.is_file():
+        return direct
+    stem = Path(image_name).stem.casefold()
+    matches = [
+        p for p in GT_DIR.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS and p.stem.casefold() == stem
+    ]
+    return sorted(matches)[0] if matches else None
+
+
+def load_rgb(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def evaluate_pair(
+    prediction: np.ndarray,
+    ground_truth: np.ndarray,
+    device: torch.device,
+    ssim_metric: StructuralSimilarityIndexMeasure,
+    lpips_metric: LearnedPerceptualImagePatchSimilarity,
+) -> dict[str, float]:
+    pred = prediction.astype(np.float32) / 255.0
+    gt = ground_truth.astype(np.float32) / 255.0
+    diff = pred - gt
+    mse = float(np.mean(diff * diff))
+    mae = float(np.mean(np.abs(diff)))
+    psnr = float("inf") if mse <= 0 else -10.0 * math.log10(mse)
+    psnr_norm = min(max(psnr / PSNR_MAX, 0.0), 1.0)
+    pred_t = torch.from_numpy(pred).permute(2, 0, 1).unsqueeze(0).to(device)
+    gt_t = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device)
+    ssim_metric.reset()
+    lpips_metric.reset()
+    with torch.inference_mode():
+        ssim = float(ssim_metric(pred_t, gt_t).item())
+        lpips = float(lpips_metric(pred_t, gt_t).item())
+    score = 0.4 * (1.0 - lpips) + 0.3 * ssim + 0.3 * psnr_norm
+    return {
+        "psnr": psnr, "psnr_norm": psnr_norm, "ssim": ssim,
+        "lpips": lpips, "score": score, "mse": mse, "mae": mae,
+    }
+
+
+def finite_mean(values: list[float]) -> float:
+    finite = [v for v in values if math.isfinite(v)]
+    return statistics.fmean(finite) if finite else float("nan")
+
+
+def write_metrics(
+    rows: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    metrics_dir: Path,
+    checkpoint_path: Path,
+    meta: dict[str, Any],
+    distortion: dict[str, Any],
+) -> None:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "image_name", "status", "message", "render_seconds",
+        "psnr", "psnr_norm", "ssim", "lpips", "score", "mse", "mae",
+    ]
+    with (metrics_dir / "metrics_per_image.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    ok = [row for row in rows if row.get("status") == "ok"]
+    numeric = {
+        key: finite_mean([float(row[key]) for row in ok])
+        for key in ("psnr", "psnr_norm", "ssim", "lpips", "score", "mse", "mae")
+    }
+    missing = sum(row.get("status") == "missing_gt" for row in rows)
+    mismatch = sum(row.get("status") == "size_mismatch" for row in rows)
+    errors = sum(row.get("status") == "error" for row in rows)
+    score_from_means = (
+        0.4 * (1.0 - numeric["lpips"])
+        + 0.3 * numeric["ssim"]
+        + 0.3 * min(max(numeric["psnr"] / PSNR_MAX, 0.0), 1.0)
+    )
+    summary = {
+        "scene": SCENE_NAME,
+        "run": RUN_NAME,
+        "checkpoint": str(checkpoint_path),
+        "expected_images": len(records),
+        "evaluated_images": len(ok),
+        "missing_gt": missing,
+        "size_mismatch": mismatch,
+        "evaluation_errors": errors,
+        "metrics": numeric,
+        "score_from_mean_metrics": score_from_means,
+        "psnr_max": PSNR_MAX,
+        "lpips_network": LPIPS_NET,
+        "native_distortion": {
+            "enabled": USE_NATIVE_DISTORTION,
+            "colmap_model": distortion["model"],
+            "radial": np.asarray(distortion["radial"]).tolist(),
+            "tangential": np.asarray(distortion["tangential"]).tolist(),
+        },
+        "model": meta,
+    }
+    (metrics_dir / "metrics_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    text = f"""==========================================
+3DGRUT V2 NHT RENDER + EVALUATION SUMMARY
+==========================================
+Scene                  : {SCENE_NAME}
+Run                    : {RUN_NAME}
+Checkpoint             : {checkpoint_path}
+Renderer               : native 3DGUT
+COLMAP camera model     : {distortion['model']}
+Native distortion       : {USE_NATIVE_DISTORTION}
+Radial coefficients     : {np.asarray(distortion['radial']).tolist()}
+NHT decoder state       : {meta['decoder_state']}
+Post processing         : {meta['post_processing']}
+Number of Gaussians     : {meta['num_gaussians']}
+Expected images         : {len(records)}
+Evaluated images        : {len(ok)}
+Missing GT              : {missing}
+Size mismatch           : {mismatch}
+Evaluation errors       : {errors}
+------------------------------------------
+PSNR mean               : {numeric['psnr']:.8f}
+PSNR norm mean          : {numeric['psnr_norm']:.8f}
+SSIM mean               : {numeric['ssim']:.8f}
+LPIPS mean              : {numeric['lpips']:.8f}
+Official score mean     : {numeric['score']:.8f}
+Score from mean metrics : {score_from_means:.8f}
+MSE mean                : {numeric['mse']:.10f}
+MAE mean                : {numeric['mae']:.10f}
+------------------------------------------
+Formula:
+score = 0.4*(1-LPIPS) + 0.3*SSIM + 0.3*clamp(PSNR/PSNR_MAX, 0, 1)
+PSNR_MAX                : {PSNR_MAX}
+LPIPS network           : {LPIPS_NET}
+==========================================
+"""
+    (metrics_dir / "metrics_summary.txt").write_text(text, encoding="utf-8")
+    print("\n" + text)
+    print(f"Per-image metrics: {metrics_dir / 'metrics_per_image.csv'}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 
 def main() -> None:
-    if APPEARANCE_MODE not in {"native_distortion", "ppisp_raw"}:
-        fail("APPEARANCE_MODE must be 'native_distortion' or 'ppisp_raw'.")
-    if GEOMETRY_STEPS + COLOR_REFINE_STEPS != MAX_STEPS:
-        fail("GEOMETRY_STEPS + COLOR_REFINE_STEPS must equal MAX_STEPS.")
-    if MAX_STEPS not in SAVE_STEPS:
-        fail("SAVE_STEPS must contain MAX_STEPS.")
-    if any(step <= 0 or step > MAX_STEPS for step in SAVE_STEPS):
-        fail(f"Every save step must satisfy 0 < step <= {MAX_STEPS}.")
-
-    root = locate_3dgrut_root()
-    dataset_file = root / "threedgrut" / "datasets" / "dataset_colmap.py"
-    trainer_file = root / "threedgrut" / "trainer.py"
-    feature_decoder_file = root / "threedgrut" / "model" / "feature_decoder.py"
-    train_entry = root / "train.py"
-
-    required = [
-        SOURCE_SCENE_ROOT / "images",
-        SOURCE_SCENE_ROOT / "sparse" / "0" / "cameras.bin",
-        SOURCE_SCENE_ROOT / "sparse" / "0" / "images.bin",
-        SOURCE_SCENE_ROOT / "sparse" / "0" / "points3D.bin",
-    ]
-    for path in required:
+    locate_3dgrut_root()
+    if not torch.cuda.is_available():
+        fail("CUDA is not available.")
+    if LPIPS_NET not in {"vgg", "alex", "squeeze"}:
+        fail("LPIPS_NET must be 'vgg', 'alex', or 'squeeze'.")
+    for path in (TEST_CSV_PATH, CAMERAS_BIN_PATH):
         if not path.exists():
-            fail(f"Dataset component is missing: {path}")
+            fail(f"Required test component is missing: {path}")
 
-    print("========== 3DGRUT V2 PREPARATION ==========")
-    print(f"Repository root       : {root}")
-    print(f"Git revision          : {git_revision(root)}")
-    print(f"Tested commit         : {EXPECTED_3DGRUT_COMMIT}")
+    if ENABLE_EVALUATION and not GT_DIR.is_dir():
+        fail(
+            f"ENABLE_EVALUATION is active but the GT directory is missing: {GT_DIR}"
+        )
 
-    photo_summary = prepare_photometric_dataset()
-    horizon_report = (PHOTO_DATASET_ROOT / HORIZON_REPORT_FILENAME).resolve()
+    checkpoint_path, run_dir = resolve_checkpoint()
+    device = torch.device(f"cuda:{GPU_ID}")
+    torch.cuda.set_device(device)
+    records = read_test_poses(TEST_CSV_PATH)
+    colmap_camera = select_colmap_camera()
+    distortion = distortion_from_colmap(colmap_camera)
+    model, decoder, post_processing, conf, meta = load_model(checkpoint_path, device)
 
-    if APPEARANCE_MODE == "native_distortion":
-        train_scene = PHOTO_DATASET_ROOT.resolve()
-        pp_method = "null"
-        load_exif = "false"
-    else:
-        train_scene = SOURCE_SCENE_ROOT.resolve()
-        pp_method = "ppisp"
-        load_exif = "true"
+    effective_step = int(meta["global_step"])
+    output_dir = run_dir / f"custom_test_step{effective_step}" / "renders"
+    metrics_dir = run_dir / f"custom_test_step{effective_step}" / f"_metrics_lpips_{LPIPS_NET}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    patch_colmap_missing_rgb_filter(dataset_file)
-    patch_horizon_aware_loss(trainer_file)
-    patch_tcnn_jit_control(feature_decoder_file)
-    if SAVE_ON_INTERRUPT:
-        patch_save_checkpoint_on_interrupt(train_entry)
+    ssim_metric = None
+    lpips_metric = None
+    if ENABLE_EVALUATION:
+        ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        lpips_metric = LearnedPerceptualImagePatchSimilarity(
+            net_type=LPIPS_NET, normalize=True
+        ).to(device)
 
-    experiment_dir = OUT_ROOT / RUN_NAME
-    resume_checkpoint = newest_checkpoint(experiment_dir)
+    print("========== 3DGRUT V2 CUSTOM TEST RENDER ==========")
+    print(f"Checkpoint          : {checkpoint_path}")
+    print(f"Run directory       : {run_dir}")
+    print(f"Test CSV            : {TEST_CSV_PATH}")
+    print(f"Ground Truth        : {GT_DIR}")
+    print(f"Test poses          : {len(records)}")
+    print(f"Gaussians           : {meta['num_gaussians']:,}")
+    print(f"NHT decoder         : {meta['decoder_state']}")
+    print(f"Post processing     : {meta['post_processing']}")
+    print(f"COLMAP camera model : {distortion['model']}")
+    print(f"Radial coefficients : {np.asarray(distortion['radial']).tolist()}")
+    print(f"Physical GPU        : {os.environ.get('PHYSICAL_GPU_ID', 'unknown')}")
+    print(f"PyTorch device      : {device}")
+    print(f"Checkpoint request  : {_checkpoint_step_raw}")
+    print(f"Evaluation enabled  : {ENABLE_EVALUATION}")
+    print(f"LPIPS network       : {LPIPS_NET if ENABLE_EVALUATION else 'disabled'}")
+    print(f"Output              : {output_dir}")
 
-    if resume_checkpoint is not None:
-        if OVERWRITE_EXPERIMENT:
-            print(
-                f"[Resume] OVERWRITE_EXPERIMENT=True; deleting old run: "
-                f"{experiment_dir}"
+    camera_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, dict[str, Any], torch.Tensor]] = {}
+    rows: list[dict[str, Any]] = []
+
+    # CUDA/plugin warmup on the first pose.
+    first_batch = make_batch(records[0], distortion, camera_cache, device)
+    with torch.inference_mode():
+        for _ in range(2):
+            warm = model(first_batch, train=False, frame_id=effective_step)
+            if decoder is not None:
+                warm = apply_feature_decoder(
+                    decoder,
+                    warm,
+                    first_batch,
+                    training=False,
+                    center_ray_encoding=bool(getattr(conf.model.nht_decoder, "center_ray_encoding", False)),
+                )
+            warm = apply_background(model.background, warm, first_batch, training=False)
+            if post_processing is not None:
+                warm = apply_post_processing(post_processing, warm, first_batch, training=False)
+        torch.cuda.synchronize(device)
+
+    for record in tqdm(records, desc="Rendering native 3DGUT test poses"):
+        output_path = output_path_for(output_dir, record["image_name"])
+        row: dict[str, Any] = {
+            "image_name": record["image_name"],
+            "status": "not_evaluated",
+            "message": "",
+            "render_seconds": "",
+        }
+        try:
+            if output_path.exists() and not OVERWRITE:
+                actual_output = output_path
+                render_seconds = 0.0
+            else:
+                batch = make_batch(record, distortion, camera_cache, device)
+                torch.cuda.synchronize(device)
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    outputs = model(batch, train=False, frame_id=effective_step)
+                    if decoder is not None:
+                        outputs = apply_feature_decoder(
+                            decoder,
+                            outputs,
+                            batch,
+                            training=False,
+                            center_ray_encoding=bool(
+                                getattr(conf.model.nht_decoder, "center_ray_encoding", False)
+                            ),
+                        )
+                    outputs = apply_background(model.background, outputs, batch, training=False)
+                    if post_processing is not None:
+                        outputs = apply_post_processing(post_processing, outputs, batch, training=False)
+                    rgb = outputs["pred_features"].clamp(0.0, 1.0)
+                torch.cuda.synchronize(device)
+                render_seconds = time.perf_counter() - started
+                rgb_u8 = rgb[0].mul(255.0).round().to(torch.uint8).cpu().numpy()
+                actual_output = save_rgb(rgb_u8, output_path)
+                if SAVE_ALPHA and "pred_opacity" in outputs:
+                    alpha = outputs["pred_opacity"][0]
+                    if alpha.ndim == 3:
+                        alpha = alpha[..., 0]
+                    alpha_u8 = alpha.clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy()
+                    Image.fromarray(alpha_u8, mode="L").save(
+                        actual_output.with_name(actual_output.stem + "_alpha.png")
+                    )
+
+            row["render_seconds"] = f"{render_seconds:.8f}"
+            if not ENABLE_EVALUATION:
+                row["status"] = "rendered"
+                row["message"] = "Evaluation disabled."
+                rows.append(row)
+                continue
+
+            gt_path = find_gt_path(record["image_name"])
+            if gt_path is None:
+                row["status"] = "missing_gt"
+                row["message"] = "Ground Truth not found."
+                rows.append(row)
+                continue
+
+            prediction = load_rgb(actual_output)
+            ground_truth = load_rgb(gt_path)
+            pred_size = (prediction.shape[1], prediction.shape[0])
+            gt_size = (ground_truth.shape[1], ground_truth.shape[0])
+            if pred_size != gt_size:
+                if RESIZE_PREDICTION_TO_GT:
+                    prediction = np.asarray(
+                        Image.fromarray(prediction).resize(gt_size, Image.Resampling.LANCZOS),
+                        dtype=np.uint8,
+                    )
+                else:
+                    row["status"] = "size_mismatch"
+                    row["message"] = f"GT={gt_size}, prediction={pred_size}"
+                    rows.append(row)
+                    continue
+
+            assert ssim_metric is not None
+            assert lpips_metric is not None
+            values = evaluate_pair(
+                prediction, ground_truth, device, ssim_metric, lpips_metric
             )
-            shutil.rmtree(experiment_dir)
-            resume_checkpoint = None
-        elif AUTO_RESUME:
-            print(f"[Resume] Found checkpoint: {resume_checkpoint}")
-            print("[Resume] Training will continue from its stored global_step.")
-        else:
-            fail(
-                f"A checkpoint already exists under: {experiment_dir}\n"
-                "Set AUTO_RESUME=true to continue, OVERWRITE_EXPERIMENT=true "
-                "to restart, or change RUN_NAME."
-            )
+            row.update({key: f"{value:.10f}" for key, value in values.items()})
+            row["status"] = "ok"
+        except Exception as exc:
+            row["status"] = "error"
+            row["message"] = f"{type(exc).__name__}: {exc}"
+            if not CONTINUE_ON_EVAL_ERROR:
+                raise
+        rows.append(row)
 
-    command = [
-        sys.executable,
-        str(train_entry),
-        "--config-name", "apps/colmap_3dgut_mcmc_nht.yaml",
-        f"path={train_scene}",
-        f"out_dir={OUT_ROOT.resolve()}",
-        f"experiment_name={RUN_NAME}",
-        f"n_iterations={MAX_STEPS}",
-        f"num_workers={NUM_WORKERS}",
-        "val_frequency=999999",
-        "test_last=false",
-        "compute_extra_metrics=false",
-        f"dataset.downsample_factor={DATA_FACTOR}",
-        f"dataset.test_split_interval={TEST_SPLIT_INTERVAL}",
-        f"dataset.normalize_world_space={str(NORMALIZE_WORLD_SPACE).lower()}",
-        f"dataset.gsplat_image_downscale={str(GSPLAT_IMAGE_DOWNSCALE).lower()}",
-        f"dataset.load_exif={load_exif}",
-        f"strategy.add.max_n_gaussians={CAP_MAX}",
-        f"strategy.add.end_iteration={GEOMETRY_STEPS}",
-        f"strategy.relocate.end_iteration={GEOMETRY_STEPS}",
-        f"strategy.perturb.end_iteration={GEOMETRY_STEPS}",
-        f"model.nht_features.dim={NHT_FEATURE_DIM}",
-        f"model.nht_decoder.hidden_dim={NHT_DECODER_HIDDEN_DIM}",
-        f"model.nht_decoder.num_layers={NHT_DECODER_NUM_LAYERS}",
-        f"model.nht_decoder.learning_rate={NHT_DECODER_LR}",
-        f"model.nht_decoder.ema_decay={NHT_DECODER_EMA_DECAY}",
-        f"model.nht_decoder.color_refine_steps={COLOR_REFINE_STEPS}",
-        f"model.nht_decoder.scheduler.max_steps={MAX_STEPS}",
-        f"scheduler.features.max_steps={MAX_STEPS}",
-        f"scheduler.positions.max_steps={GEOMETRY_STEPS}",
-        f"render.particle_feature_half={str(PARTICLE_FEATURE_HALF).lower()}",
-        f"render.feature_output_half={str(FEATURE_OUTPUT_HALF).lower()}",
-        f"render.particle_kernel_max_alpha={PARTICLE_KERNEL_MAX_ALPHA}",
-        f"render.splat.ut_alpha={UT_ALPHA}",
-        f"loss.use_opacity={str(USE_OPACITY_REG).lower()}",
-        f"loss.lambda_opacity={LAMBDA_OPACITY}",
-        f"loss.use_scale={str(USE_SCALE_REG).lower()}",
-        f"loss.lambda_scale={LAMBDA_SCALE}",
-        "checkpoint.iterations=[" + ",".join(str(step) for step in SAVE_STEPS) + "]",
-        f"post_processing.method={pp_method}",
-        f"+loss.horizon_aware.enabled={str(HORIZON_AWARE_LOSS).lower()}",
-        f"+loss.horizon_aware.report_path={horizon_report}",
-        f"+loss.horizon_aware.report_filename={HORIZON_REPORT_FILENAME}",
-        f"+loss.horizon_aware.top_region_end={HORIZON_TOP_REGION_END}",
-        f"+loss.horizon_aware.sky_interior_end={HORIZON_SKY_INTERIOR_END}",
-        f"+loss.horizon_aware.sky_luma_min={HORIZON_SKY_LUMA_MIN}",
-        f"+loss.horizon_aware.sky_edge_max={HORIZON_SKY_EDGE_MAX}",
-        f"+loss.horizon_aware.edge_threshold={HORIZON_EDGE_THRESHOLD}",
-        f"+loss.horizon_aware.sky_weight={HORIZON_SKY_WEIGHT}",
-        f"+loss.horizon_aware.band_weight={HORIZON_BAND_WEIGHT}",
-        f"+loss.horizon_aware.top_foreground_weight={HORIZON_TOP_FOREGROUND_WEIGHT}",
-        f"+loss.horizon_aware.edge_loss_weight={HORIZON_EDGE_LOSS_WEIGHT}",
-    ]
-    if APPEARANCE_MODE == "ppisp_raw":
-        command.extend([
-            f"post_processing.use_controller={str(PPISP_USE_CONTROLLER).lower()}",
-            f"post_processing.n_distillation_steps={PPISP_DISTILLATION_STEPS}",
-        ])
-
-    if resume_checkpoint is not None:
-        command.append(f"resume={resume_checkpoint.resolve()}")
-
-    print("\n========== 3DGRUT TRAIN CONFIG ==========")
-    print(f"Mode                  : {APPEARANCE_MODE}")
-    print(f"Dataset               : {train_scene}")
-    print(f"Photo images          : {photo_summary['source_images']}")
-    print(f"Photo corrected       : {photo_summary['corrected_images']}")
-    print(f"Upper-bright images   : {photo_summary['upper_bright_images']}")
-    print("Camera projection     : native 3DGUT distortion")
-    print(f"Steps                 : {MAX_STEPS:,}")
-    print(f"Geometry steps        : {GEOMETRY_STEPS:,}")
-    print(f"Color refine steps    : {COLOR_REFINE_STEPS:,}")
-    print(f"Save steps            : {SAVE_STEPS}")
-    print(f"MCMC cap              : {CAP_MAX:,}")
-    print(f"NHT feature dim       : {NHT_FEATURE_DIM}")
-    print(f"PPISP                 : {pp_method}")
-    print(f"Horizon report        : {horizon_report}")
-    print(f"TCNN JIT fusion       : {TCNN_JIT_FUSION}")
-    print(f"Auto resume           : {AUTO_RESUME}")
-    print(f"Resume checkpoint     : {resume_checkpoint or 'none'}")
-    print(f"Output experiment     : {experiment_dir}")
-    print("\nCommand:")
-    print(" \\\n  ".join(command))
-
-    if DRY_RUN:
-        print("\nDRY_RUN=True: patches were checked/applied; training was not started.")
-        return
-
-    environment = os.environ.copy()
-    environment["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
-    environment["PYTHONUNBUFFERED"] = "1"
-    environment["TCNN_JIT_FUSION"] = "1" if TCNN_JIT_FUSION else "0"
-    environment.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-    subprocess.run(command, cwd=str(root), env=environment, check=True)
-
-    checkpoint = newest_checkpoint(experiment_dir)
-    if checkpoint is None:
-        fail(f"Training finished but ckpt_last.pt was not found under: {experiment_dir}")
-
-    manifest = {
-        "scene": SCENE_NAME,
-        "run_name": RUN_NAME,
-        "appearance_mode": APPEARANCE_MODE,
-        "checkpoint": str(checkpoint.resolve()),
-        "experiment_dir": str(experiment_dir.resolve()),
-        "source_scene": str(SOURCE_SCENE_ROOT.resolve()),
-        "train_scene": str(train_scene),
-        "horizon_report": str(horizon_report),
-        "git_revision": git_revision(root),
-        "max_steps": MAX_STEPS,
-        "geometry_steps": GEOMETRY_STEPS,
-        "color_refine_steps": COLOR_REFINE_STEPS,
-        "cap_max": CAP_MAX,
-        "nht_feature_dim": NHT_FEATURE_DIM,
-        "resumed_from": str(resume_checkpoint.resolve()) if resume_checkpoint else None,
-        "tcnn_jit_fusion": TCNN_JIT_FUSION,
-    }
-    manifest_path = experiment_dir / "latest_run.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print("\n========== 3DGRUT TRAIN FINISHED ==========")
-    print(f"Checkpoint : {checkpoint}")
-    print(f"Manifest   : {manifest_path}")
+    write_metrics(rows, records, metrics_dir, checkpoint_path, meta, distortion)
 
 
 if __name__ == "__main__":
     main()
 
-__TRAIN_3DGRUT_V2_PY__
-    chmod +x "$TRAIN_LAUNCHER"
-    "$REPO_DIR/.venv/bin/python" -m py_compile "$TRAIN_LAUNCHER"
-    echo "[Code] Embedded trainer created and syntax-checked: $TRAIN_LAUNCHER"
+__RENDER_3DGRUT_V2_PY__
+
+    chmod +x "$RENDER_LAUNCHER"
+    "$VENV_DIR/bin/python" -m py_compile "$RENDER_LAUNCHER"
+    echo "[Code] Embedded renderer created: $RENDER_LAUNCHER"
 }
 
-run_training() {
-    cd "$REPO_DIR"
-
+run_renderer() {
     export SCENE_NAME
-    export GPU_ID
-    export NUM_WORKERS
     export APPEARANCE_MODE
     export MAX_STEPS
-    export GEOMETRY_STEPS
-    export COLOR_REFINE_STEPS
-    export SAVE_STEPS
     export CAP_MAX
     export NHT_FEATURE_DIM
-    export DATA_FACTOR
-    export TEST_SPLIT_INTERVAL
-    export NORMALIZE_WORLD_SPACE
-    export GSPLAT_IMAGE_DOWNSCALE
-    export FORCE_REBUILD_PHOTOMETRIC
-    export OVERWRITE_EXPERIMENT
-    export DRY_RUN
-    export AUTO_RESUME
-    export SAVE_ON_INTERRUPT
-    export TCNN_JIT_FUSION
-    export OUT_ROOT
-    export PYTORCH_ALLOC_CONF
-    export CUDA_DEVICE_ORDER
-    export CUDA_VISIBLE_DEVICES="$GPU_ID"
-    export PHYSICAL_GPU_ID="$GPU_ID"
-    export PYTHONUNBUFFERED=1
-    export MAX_JOBS
-
-    if [[ -n "$RUN_NAME" ]]; then
-        export RUN_NAME
-    else
-        unset RUN_NAME || true
-    fi
+    export RUN_NAME
+    export EXPERIMENT_DIR="$OUT_ROOT/$RUN_NAME"
+    export CHECKPOINT_STEP
+    export CHECKPOINT_PATH
+    export LPIPS_NET
+    export ENABLE_EVALUATION
+    export USE_NATIVE_DISTORTION
+    export USE_FEATURE_DECODER_EMA
+    export OVERWRITE_RENDER
+    export SAVE_ALPHA
+    export MAX_IMAGES
+    export FORCE_OUTPUT_EXTENSION
+    export RESIZE_PREDICTION_TO_GT
+    export CONTINUE_ON_EVAL_ERROR
+    export RENDER_LOGICAL_GPU_ID=0
 
     echo
     echo "============================================================"
-    echo "TRAINING CONFIGURATION"
+    echo "3DGRUT RENDER CONFIGURATION"
     echo "============================================================"
-    echo "Dataset              : $REPO_DIR/data/$SCENE_NAME"
+    echo "Scene                : $SCENE_NAME"
+    echo "Run name             : $RUN_NAME"
+    echo "Experiment directory : $EXPERIMENT_DIR"
+    echo "Checkpoint request   : $CHECKPOINT_STEP"
+    echo "Checkpoint path      : ${CHECKPOINT_PATH:-auto}"
     echo "Physical GPU         : $GPU_ID"
-    echo "PyTorch GPU          : cuda:0 (mapped from physical GPU $GPU_ID)"
-    echo "CUDA visible devices : $CUDA_VISIBLE_DEVICES"
-    echo "Appearance mode      : $APPEARANCE_MODE"
-    echo "Max steps            : $MAX_STEPS"
-    echo "Geometry steps       : $GEOMETRY_STEPS"
-    echo "Color refine steps   : $COLOR_REFINE_STEPS"
-    echo "Save steps           : $SAVE_STEPS"
-    echo "Gaussian cap         : $CAP_MAX"
-    echo "NHT feature dim      : $NHT_FEATURE_DIM"
-    echo "Auto resume          : $AUTO_RESUME"
-    echo "Save on Ctrl+C       : $SAVE_ON_INTERRUPT"
-    echo "TCNN JIT fusion      : $TCNN_JIT_FUSION"
-    echo "Output root          : $OUT_ROOT"
+    echo "PyTorch device       : cuda:0"
+    echo "Venv                  : $VENV_DIR"
+    echo "Slang compiler        : $(command -v slangc)"
+    echo "Native distortion    : $USE_NATIVE_DISTORTION"
+    echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
+    echo "Evaluation           : $ENABLE_EVALUATION"
+    echo "LPIPS                : $LPIPS_NET"
+    echo "Overwrite renders    : $OVERWRITE_RENDER"
+    echo "Max images           : ${MAX_IMAGES:-all}"
+    echo "Log                  : $LOG_FILE"
     echo "============================================================"
     echo
 
-    "$REPO_DIR/.venv/bin/python" "$TRAIN_LAUNCHER"
+    cd "$REPO_DIR"
+    "$VENV_DIR/bin/python" "$RENDER_LAUNCHER"
 }
 
 # =============================================================================
 # EXECUTION
 # =============================================================================
 
-install_ubuntu_packages
-detect_cuda
-install_uv
-clone_or_update_repo
-setup_python_environment
-prepare_dataset_link
-write_embedded_trainer
-run_training
+echo "============================================================"
+echo "3DGRUT ONE-FILE RENDER"
+echo "============================================================"
+echo "Script directory : $SCRIPT_DIR"
+echo "AI Tuyen root    : $AI_TUYEN_ROOT"
+echo "Repository       : $REPO_DIR"
+echo "Venv             : $VENV_DIR"
+echo "Scene            : $SCENE_NAME"
+echo "Physical GPU     : $GPU_ID"
+echo "Auto slangc      : $AUTO_INSTALL_SLANGC"
+echo "============================================================"
+
+check_runtime
+ensure_slangc
+prepare_dataset_view
+patch_tcnn_jit_control
+write_embedded_renderer
+run_renderer
 
 echo
 echo "============================================================"
-echo "ALL DONE"
+echo "RENDER FINISHED"
 echo "============================================================"
-echo "Repository : $REPO_DIR"
-echo "Runs       : $OUT_ROOT"
-echo "Log        : $LOG_FILE"
+echo "Run      : $OUT_ROOT/$RUN_NAME"
+echo "Log      : $LOG_FILE"
 echo "============================================================"
