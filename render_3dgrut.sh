@@ -107,19 +107,38 @@ CONTINUE_ON_EVAL_ERROR="${CONTINUE_ON_EVAL_ERROR:-true}"
 TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
 export TCNN_JIT_FUSION
 
-# The optimized 3DGUT culling path can trigger cudaErrorIllegalAddress with
-# very large Gaussian clouds. Safe mode compiles a dedicated renderer variant
-# with the three problematic culling optimizations disabled.
+# Rendering backend:
+#   auto   : use 3DGRT for large 3DGUT checkpoints; otherwise keep checkpoint backend
+#   3dgrt  : force OptiX ray tracing while preserving Gaussian/NHT parameters
+#   3dgut  : force native 3DGUT rasterization
+#
+# The upstream 3DGUT rasterizer has a known cudaErrorIllegalAddress path with
+# large Gaussian clouds. This checkpoint has 2,000,000 Gaussians, so auto mode
+# switches inference to 3DGRT before constructing the renderer.
+RENDER_BACKEND="${RENDER_BACKEND:-auto}"
+AUTO_3DGRT_THRESHOLD="${AUTO_3DGRT_THRESHOLD:-200000}"
 SAFE_3DGUT_RENDER="${SAFE_3DGUT_RENDER:-true}"
+
+# Optional emergency fallback. 0 keeps all Gaussians. When set, the renderer
+# keeps the top-K Gaussians by raw density before model initialization.
+MAX_RENDER_GAUSSIANS="${MAX_RENDER_GAUSSIANS:-0}"
+
 MAX_JOBS="${MAX_JOBS:-4}"
+export RENDER_BACKEND
+export AUTO_3DGRT_THRESHOLD
 export SAFE_3DGUT_RENDER
+export MAX_RENDER_GAUSSIANS
 export MAX_JOBS
 
-if [[ "$SAFE_3DGUT_RENDER" == "true" ]]; then
-    TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/3dgut_safe}"
-else
-    TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/3dgut_default}"
-fi
+case "$RENDER_BACKEND" in
+    auto|3dgrt|3dgut) ;;
+    *) die "RENDER_BACKEND must be auto, 3dgrt, or 3dgut." ;;
+esac
+
+[[ "$AUTO_3DGRT_THRESHOLD" =~ ^[0-9]+$ ]] || die     "AUTO_3DGRT_THRESHOLD must be a non-negative integer."
+[[ "$MAX_RENDER_GAUSSIANS" =~ ^[0-9]+$ ]] || die     "MAX_RENDER_GAUSSIANS must be a non-negative integer."
+
+TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/${SCENE_NAME}_fd${NHT_FEATURE_DIM}_${RENDER_BACKEND}}"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 export TORCH_EXTENSIONS_DIR
 
@@ -604,6 +623,10 @@ USE_NATIVE_DISTORTION = env_bool("USE_NATIVE_DISTORTION", True)
 USE_FEATURE_DECODER_EMA = env_bool("USE_FEATURE_DECODER_EMA", True)
 SAFE_3DGUT_RENDER = env_bool("SAFE_3DGUT_RENDER", True)
 
+RENDER_BACKEND = os.environ.get("RENDER_BACKEND", "auto").strip().lower()
+AUTO_3DGRT_THRESHOLD = int(os.environ.get("AUTO_3DGRT_THRESHOLD", "200000"))
+MAX_RENDER_GAUSSIANS = int(os.environ.get("MAX_RENDER_GAUSSIANS", "0"))
+
 LPIPS_NET = os.environ.get("LPIPS_NET", "vgg").strip().lower()
 PSNR_MAX = float(os.environ.get("PSNR_MAX", "40.0"))
 BACKGROUND_OVERRIDE: tuple[float, float, float] | None = None
@@ -989,47 +1012,132 @@ def load_feature_decoder(
     return decoder, state_name
 
 
-def configure_3dgut_runtime(conf: Any) -> dict[str, bool]:
-    """Apply a conservative 3DGUT culling configuration for large models."""
-    splat = conf.render.splat
-    before = {
-        "rect_bounding": bool(splat.rect_bounding),
-        "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
-        "tile_based_culling": bool(splat.tile_based_culling),
+def _mutate_render_config(conf: Any, callback: Any) -> None:
+    """Temporarily unlock OmegaConf, apply a mutation, then restore readonly."""
+    try:
+        from omegaconf import OmegaConf
+
+        was_readonly = bool(OmegaConf.is_readonly(conf))
+        if was_readonly:
+            OmegaConf.set_readonly(conf, False)
+        callback()
+        if was_readonly:
+            OmegaConf.set_readonly(conf, True)
+    except Exception:
+        callback()
+
+
+def configure_render_backend(conf: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    original_backend = str(conf.render.method).strip().lower()
+    checkpoint_gaussians = int(checkpoint["positions"].shape[0])
+
+    if RENDER_BACKEND not in {"auto", "3dgrt", "3dgut"}:
+        fail("RENDER_BACKEND must be auto, 3dgrt, or 3dgut.")
+
+    if RENDER_BACKEND == "auto":
+        if original_backend == "3dgut" and checkpoint_gaussians > AUTO_3DGRT_THRESHOLD:
+            effective_backend = "3dgrt"
+            reason = (
+                f"3DGUT checkpoint has {checkpoint_gaussians:,} Gaussians, "
+                f"above auto threshold {AUTO_3DGRT_THRESHOLD:,}"
+            )
+        else:
+            effective_backend = original_backend
+            reason = "checkpoint backend is below the auto-switch threshold"
+    else:
+        effective_backend = RENDER_BACKEND
+        reason = "explicit backend request"
+
+    def apply_backend() -> None:
+        conf.render.method = effective_backend
+        if effective_backend == "3dgut" and SAFE_3DGUT_RENDER:
+            conf.render.splat.rect_bounding = False
+            conf.render.splat.tight_opacity_bounding = False
+            conf.render.splat.tile_based_culling = False
+
+    _mutate_render_config(conf, apply_backend)
+
+    effective_culling: dict[str, bool] | None = None
+    if effective_backend == "3dgut":
+        splat = conf.render.splat
+        effective_culling = {
+            "rect_bounding": bool(splat.rect_bounding),
+            "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
+            "tile_based_culling": bool(splat.tile_based_culling),
+        }
+
+    info = {
+        "requested_backend": RENDER_BACKEND,
+        "original_backend": original_backend,
+        "effective_backend": effective_backend,
+        "switch_reason": reason,
+        "checkpoint_gaussians": checkpoint_gaussians,
+        "effective_culling": effective_culling,
     }
 
-    if SAFE_3DGUT_RENDER:
-        try:
-            from omegaconf import OmegaConf
+    print("[Renderer] Requested       :", RENDER_BACKEND)
+    print("[Renderer] Checkpoint      :", original_backend)
+    print("[Renderer] Effective       :", effective_backend)
+    print("[Renderer] Reason          :", reason)
+    print("[Renderer] Gaussian count  :", f"{checkpoint_gaussians:,}")
+    print("[Renderer] 3DGUT culling   :", effective_culling)
+    print("[Renderer] Extension cache :", os.environ.get("TORCH_EXTENSIONS_DIR", "default"))
+    return info
 
-            was_readonly = bool(OmegaConf.is_readonly(conf))
-            if was_readonly:
-                OmegaConf.set_readonly(conf, False)
 
-            splat.rect_bounding = False
-            splat.tight_opacity_bounding = False
-            splat.tile_based_culling = False
+def limit_checkpoint_gaussians(
+    checkpoint: dict[str, Any],
+    max_gaussians: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Optionally retain top-K Gaussian parameter rows by raw density."""
+    original_count = int(checkpoint["positions"].shape[0])
+    if max_gaussians <= 0 or max_gaussians >= original_count:
+        return checkpoint, {
+            "original_count": original_count,
+            "render_count": original_count,
+            "limited": False,
+        }
 
-            if was_readonly:
-                OmegaConf.set_readonly(conf, True)
-        except Exception:
-            # Existing keys can also be assigned directly on non-OmegaConf
-            # configuration objects.
-            splat.rect_bounding = False
-            splat.tight_opacity_bounding = False
-            splat.tile_based_culling = False
+    density = checkpoint["density"].detach().reshape(-1)
+    keep = torch.topk(
+        density,
+        k=max_gaussians,
+        largest=True,
+        sorted=False,
+    ).indices
+    keep = torch.sort(keep).values
 
-    after = {
-        "rect_bounding": bool(splat.rect_bounding),
-        "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
-        "tile_based_culling": bool(splat.tile_based_culling),
+    reduced = dict(checkpoint)
+    parameter_fields = (
+        "positions",
+        "rotation",
+        "scale",
+        "density",
+        "features",
+        "features_albedo",
+        "features_specular",
+    )
+
+    for field in parameter_fields:
+        value = checkpoint.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            continue
+        if value.ndim == 0 or int(value.shape[0]) != original_count:
+            continue
+        selected = value.detach().index_select(0, keep).contiguous()
+        reduced[field] = torch.nn.Parameter(selected, requires_grad=False)
+
+    print(
+        "[Renderer] Gaussian limit :",
+        f"{original_count:,} -> {max_gaussians:,} (top raw density)",
+    )
+    return reduced, {
+        "original_count": original_count,
+        "render_count": max_gaussians,
+        "limited": True,
     }
-
-    print("[3DGUT] Safe renderer     :", SAFE_3DGUT_RENDER)
-    print("[3DGUT] Culling original  :", before)
-    print("[3DGUT] Culling effective :", after)
-    print("[3DGUT] Extension cache   :", os.environ.get("TORCH_EXTENSIONS_DIR", "default"))
-    return after
 
 
 def validate_first_batch(record: dict[str, Any], batch: Batch, device: torch.device) -> None:
@@ -1102,26 +1210,72 @@ def load_model(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if "config" not in checkpoint:
         fail(f"Checkpoint has no config: {checkpoint_path}")
+
     conf = checkpoint["config"]
-    if str(conf.render.method) != "3dgut":
-        fail(f"Expected a 3DGUT checkpoint, got render.method={conf.render.method}")
-    effective_culling = configure_3dgut_runtime(conf)
+    original_backend = str(conf.render.method).strip().lower()
+    if original_backend not in {"3dgut", "3dgrt"}:
+        fail(f"Unsupported checkpoint render.method={conf.render.method}")
+
+    backend_info = configure_render_backend(conf, checkpoint)
+    checkpoint_for_render, limit_info = limit_checkpoint_gaussians(
+        checkpoint,
+        MAX_RENDER_GAUSSIANS,
+    )
+
+    print(
+        "[Renderer] Constructing   :",
+        f"MixtureOfGaussians(method={backend_info['effective_backend']})",
+    )
     model = MixtureOfGaussians(conf)
-    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
-    model.build_acc()
+    model.init_from_checkpoint(checkpoint_for_render, setup_optimizer=False)
     model.eval()
-    decoder, decoder_state = load_feature_decoder(checkpoint, conf, model, device)
+
+    torch.cuda.empty_cache()
+    free_before, total_bytes = torch.cuda.mem_get_info(device)
+    print(
+        "[Renderer] Build ACC      :",
+        f"backend={backend_info['effective_backend']}, "
+        f"gaussians={model.num_gaussians:,}, "
+        f"free={free_before / 1024**3:.2f} GiB",
+    )
+    model.build_acc()
+    torch.cuda.synchronize(device)
+    free_after, _ = torch.cuda.mem_get_info(device)
+    print(
+        "[Renderer] ACC ready      :",
+        f"used={(free_before - free_after) / 1024**3:.2f} GiB, "
+        f"free={free_after / 1024**3:.2f} GiB",
+    )
+
+    decoder, decoder_state = load_feature_decoder(
+        checkpoint,
+        conf,
+        model,
+        device,
+    )
     post_processing = load_post_processing(checkpoint, conf, device)
+
     meta = {
-        "global_step": int(checkpoint.get("global_step", checkpoint_step_from_path(checkpoint_path))),
+        "global_step": int(
+            checkpoint.get(
+                "global_step",
+                checkpoint_step_from_path(checkpoint_path),
+            )
+        ),
         "num_gaussians": int(model.num_gaussians),
+        "checkpoint_num_gaussians": int(limit_info["original_count"]),
+        "gaussians_limited": bool(limit_info["limited"]),
         "feature_type": str(checkpoint.get("feature_type", "unknown")),
         "particle_feature_dim": int(checkpoint.get("particle_feature_dim", -1)),
         "ray_feature_dim": int(checkpoint.get("ray_feature_dim", -1)),
         "decoder_state": decoder_state,
         "post_processing": str(conf.post_processing.method),
+        "requested_backend": backend_info["requested_backend"],
+        "original_backend": backend_info["original_backend"],
+        "render_backend": backend_info["effective_backend"],
+        "backend_reason": backend_info["switch_reason"],
         "safe_3dgut_render": SAFE_3DGUT_RENDER,
-        "effective_culling": effective_culling,
+        "effective_culling": backend_info["effective_culling"],
     }
     return model, decoder, post_processing, conf, meta
 
@@ -1332,8 +1486,13 @@ def main() -> None:
     model, decoder, post_processing, conf, meta = load_model(checkpoint_path, device)
 
     effective_step = int(meta["global_step"])
-    output_dir = run_dir / f"custom_test_step{effective_step}" / "renders"
-    metrics_dir = run_dir / f"custom_test_step{effective_step}" / f"_metrics_lpips_{LPIPS_NET}"
+    render_tag = (
+        f"{meta['render_backend']}_"
+        f"{meta['num_gaussians'] // 1000}k"
+    )
+    result_root = run_dir / f"custom_test_step{effective_step}_{render_tag}"
+    output_dir = result_root / "renders"
+    metrics_dir = result_root / f"_metrics_lpips_{LPIPS_NET}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ssim_metric = None
@@ -1350,7 +1509,12 @@ def main() -> None:
     print(f"Test CSV            : {TEST_CSV_PATH}")
     print(f"Ground Truth        : {GT_DIR}")
     print(f"Test poses          : {len(records)}")
-    print(f"Gaussians           : {meta['num_gaussians']:,}")
+    print(f"Checkpoint Gaussians: {meta['checkpoint_num_gaussians']:,}")
+    print(f"Rendered Gaussians  : {meta['num_gaussians']:,}")
+    print(f"Gaussian limited    : {meta['gaussians_limited']}")
+    print(f"Original backend    : {meta['original_backend']}")
+    print(f"Effective backend   : {meta['render_backend']}")
+    print(f"Backend reason      : {meta['backend_reason']}")
     print(f"NHT decoder         : {meta['decoder_state']}")
     print(f"Post processing     : {meta['post_processing']}")
     print(f"COLMAP camera model : {distortion['model']}")
@@ -1358,6 +1522,8 @@ def main() -> None:
     print(f"Physical GPU        : {os.environ.get('PHYSICAL_GPU_ID', 'unknown')}")
     print(f"PyTorch device      : {device}")
     print(f"Checkpoint request  : {_checkpoint_step_raw}")
+    print(f"Requested backend   : {RENDER_BACKEND}")
+    print(f"Auto GRT threshold  : {AUTO_3DGRT_THRESHOLD:,}")
     print(f"Safe 3DGUT renderer : {SAFE_3DGUT_RENDER}")
     print(f"Effective culling   : {meta['effective_culling']}")
     print(f"Extension cache     : {os.environ.get('TORCH_EXTENSIONS_DIR', 'default')}")
@@ -1390,7 +1556,10 @@ def main() -> None:
                 warm = apply_post_processing(post_processing, warm, first_batch, training=False)
         torch.cuda.synchronize(device)
 
-    for record in tqdm(records, desc="Rendering native 3DGUT test poses"):
+    for record in tqdm(
+        records,
+        desc=f"Rendering {meta['render_backend'].upper()} test poses",
+    ):
         output_path = output_path_for(output_dir, record["image_name"])
         row: dict[str, Any] = {
             "image_name": record["image_name"],
@@ -1519,7 +1688,10 @@ run_renderer() {
     export ENABLE_EVALUATION
     export USE_NATIVE_DISTORTION
     export USE_FEATURE_DECODER_EMA
+    export RENDER_BACKEND
+    export AUTO_3DGRT_THRESHOLD
     export SAFE_3DGUT_RENDER
+    export MAX_RENDER_GAUSSIANS
     export OVERWRITE_RENDER
     export SAVE_ALPHA
     export MAX_IMAGES
@@ -1543,6 +1715,9 @@ run_renderer() {
     echo "Slang compiler        : $SLANGC_BIN"
     echo "Native distortion    : $USE_NATIVE_DISTORTION"
     echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
+    echo "Render backend       : $RENDER_BACKEND"
+    echo "Auto GRT threshold   : $AUTO_3DGRT_THRESHOLD"
+    echo "Max render Gaussians : $MAX_RENDER_GAUSSIANS"
     echo "Safe 3DGUT renderer  : $SAFE_3DGUT_RENDER"
     echo "Torch extension dir  : $TORCH_EXTENSIONS_DIR"
     echo "Ninja workers        : $MAX_JOBS"
@@ -1591,5 +1766,6 @@ echo "============================================================"
 echo "RENDER FINISHED"
 echo "============================================================"
 echo "Run      : $OUT_ROOT/$RUN_NAME"
+echo "Backend  : $RENDER_BACKEND (effective backend is printed above)"
 echo "Log      : $LOG_FILE"
 echo "============================================================"
