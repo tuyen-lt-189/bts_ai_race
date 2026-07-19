@@ -103,6 +103,22 @@ CONTINUE_ON_EVAL_ERROR="${CONTINUE_ON_EVAL_ERROR:-true}"
 TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
 export TCNN_JIT_FUSION
 
+# The optimized 3DGUT culling path can trigger cudaErrorIllegalAddress with
+# very large Gaussian clouds. Safe mode compiles a dedicated renderer variant
+# with the three problematic culling optimizations disabled.
+SAFE_3DGUT_RENDER="${SAFE_3DGUT_RENDER:-true}"
+MAX_JOBS="${MAX_JOBS:-4}"
+export SAFE_3DGUT_RENDER
+export MAX_JOBS
+
+if [[ "$SAFE_3DGUT_RENDER" == "true" ]]; then
+    TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/3dgut_safe}"
+else
+    TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/3dgut_default}"
+fi
+mkdir -p "$TORCH_EXTENSIONS_DIR"
+export TORCH_EXTENSIONS_DIR
+
 # Preserve tqdm/Rich output while also writing a log.
 USE_PTY_LOGGING="${USE_PTY_LOGGING:-true}"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
@@ -542,6 +558,7 @@ GPU_ID = int(os.environ.get("RENDER_LOGICAL_GPU_ID", "0"))
 CAMERA_ID = env_optional_int("CAMERA_ID")
 USE_NATIVE_DISTORTION = env_bool("USE_NATIVE_DISTORTION", True)
 USE_FEATURE_DECODER_EMA = env_bool("USE_FEATURE_DECODER_EMA", True)
+SAFE_3DGUT_RENDER = env_bool("SAFE_3DGUT_RENDER", True)
 
 LPIPS_NET = os.environ.get("LPIPS_NET", "vgg").strip().lower()
 PSNR_MAX = float(os.environ.get("PSNR_MAX", "40.0"))
@@ -928,6 +945,112 @@ def load_feature_decoder(
     return decoder, state_name
 
 
+def configure_3dgut_runtime(conf: Any) -> dict[str, bool]:
+    """Apply a conservative 3DGUT culling configuration for large models."""
+    splat = conf.render.splat
+    before = {
+        "rect_bounding": bool(splat.rect_bounding),
+        "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
+        "tile_based_culling": bool(splat.tile_based_culling),
+    }
+
+    if SAFE_3DGUT_RENDER:
+        try:
+            from omegaconf import OmegaConf
+
+            was_readonly = bool(OmegaConf.is_readonly(conf))
+            if was_readonly:
+                OmegaConf.set_readonly(conf, False)
+
+            splat.rect_bounding = False
+            splat.tight_opacity_bounding = False
+            splat.tile_based_culling = False
+
+            if was_readonly:
+                OmegaConf.set_readonly(conf, True)
+        except Exception:
+            # Existing keys can also be assigned directly on non-OmegaConf
+            # configuration objects.
+            splat.rect_bounding = False
+            splat.tight_opacity_bounding = False
+            splat.tile_based_culling = False
+
+    after = {
+        "rect_bounding": bool(splat.rect_bounding),
+        "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
+        "tile_based_culling": bool(splat.tile_based_culling),
+    }
+
+    print("[3DGUT] Safe renderer     :", SAFE_3DGUT_RENDER)
+    print("[3DGUT] Culling original  :", before)
+    print("[3DGUT] Culling effective :", after)
+    print("[3DGUT] Extension cache   :", os.environ.get("TORCH_EXTENSIONS_DIR", "default"))
+    return after
+
+
+def validate_first_batch(record: dict[str, Any], batch: Batch, device: torch.device) -> None:
+    """Fail before entering the CUDA renderer when camera data is malformed."""
+    if record["width"] <= 0 or record["height"] <= 0:
+        fail("Invalid render resolution.")
+    if record["fx"] <= 0 or record["fy"] <= 0:
+        fail("Camera focal lengths must be positive.")
+
+    tensors = {
+        "rays_ori": batch.rays_ori,
+        "rays_dir": batch.rays_dir,
+        "T_to_world": batch.T_to_world,
+        "pixel_coords": batch.pixel_coords,
+    }
+    for name, tensor in tensors.items():
+        if not torch.isfinite(tensor).all().item():
+            fail(f"Non-finite values found in {name}.")
+        if not tensor.is_contiguous():
+            tensors[name] = tensor.contiguous()
+
+    rotation = batch.T_to_world[0, :3, :3]
+    determinant = float(torch.linalg.det(rotation).item())
+    translation = batch.T_to_world[0, :3, 3].detach().cpu().tolist()
+
+    h = int(record["height"])
+    w = int(record["width"])
+    sy = max(h // 32, 1)
+    sx = max(w // 32, 1)
+    sampled_dirs = batch.rays_dir[0, ::sy, ::sx]
+    ray_norms = torch.linalg.norm(sampled_dirs, dim=-1)
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+
+    print("[Camera] First image      :", record["image_name"])
+    print("[Camera] Resolution       :", f"{w}x{h}")
+    print(
+        "[Camera] Intrinsics       :",
+        {
+            "fx": record["fx"],
+            "fy": record["fy"],
+            "cx": record["cx"],
+            "cy": record["cy"],
+        },
+    )
+    print("[Camera] C2W translation  :", translation)
+    print("[Camera] Rotation det     :", f"{determinant:.8f}")
+    print(
+        "[Camera] Ray norm sample :",
+        f"min={float(ray_norms.min().item()):.8f}, "
+        f"max={float(ray_norms.max().item()):.8f}",
+    )
+    for name, tensor in tensors.items():
+        print(
+            f"[Camera] {name:<17}:",
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"device={tensor.device}, contiguous={tensor.is_contiguous()}",
+        )
+    print(
+        "[CUDA] Memory before render:",
+        f"free={free_bytes / 1024**3:.2f} GiB, "
+        f"total={total_bytes / 1024**3:.2f} GiB",
+    )
+
+
 def load_model(
     checkpoint_path: Path,
     device: torch.device,
@@ -938,6 +1061,7 @@ def load_model(
     conf = checkpoint["config"]
     if str(conf.render.method) != "3dgut":
         fail(f"Expected a 3DGUT checkpoint, got render.method={conf.render.method}")
+    effective_culling = configure_3dgut_runtime(conf)
     model = MixtureOfGaussians(conf)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)
     model.build_acc()
@@ -952,6 +1076,8 @@ def load_model(
         "ray_feature_dim": int(checkpoint.get("ray_feature_dim", -1)),
         "decoder_state": decoder_state,
         "post_processing": str(conf.post_processing.method),
+        "safe_3dgut_render": SAFE_3DGUT_RENDER,
+        "effective_culling": effective_culling,
     }
     return model, decoder, post_processing, conf, meta
 
@@ -1188,6 +1314,9 @@ def main() -> None:
     print(f"Physical GPU        : {os.environ.get('PHYSICAL_GPU_ID', 'unknown')}")
     print(f"PyTorch device      : {device}")
     print(f"Checkpoint request  : {_checkpoint_step_raw}")
+    print(f"Safe 3DGUT renderer : {SAFE_3DGUT_RENDER}")
+    print(f"Effective culling   : {meta['effective_culling']}")
+    print(f"Extension cache     : {os.environ.get('TORCH_EXTENSIONS_DIR', 'default')}")
     print(f"Evaluation enabled  : {ENABLE_EVALUATION}")
     print(f"LPIPS network       : {LPIPS_NET if ENABLE_EVALUATION else 'disabled'}")
     print(f"Output              : {output_dir}")
@@ -1195,8 +1324,12 @@ def main() -> None:
     camera_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, dict[str, Any], torch.Tensor]] = {}
     rows: list[dict[str, Any]] = []
 
-    # CUDA/plugin warmup on the first pose.
+    # Validate the first custom camera before entering the native CUDA renderer.
     first_batch = make_batch(records[0], distortion, camera_cache, device)
+    validate_first_batch(records[0], first_batch, device)
+    torch.cuda.empty_cache()
+
+    # CUDA/plugin warmup on the first pose.
     with torch.inference_mode():
         for _ in range(2):
             warm = model(first_batch, train=False, frame_id=effective_step)
@@ -1329,6 +1462,7 @@ run_renderer() {
     export ENABLE_EVALUATION
     export USE_NATIVE_DISTORTION
     export USE_FEATURE_DECODER_EMA
+    export SAFE_3DGUT_RENDER
     export OVERWRITE_RENDER
     export SAVE_ALPHA
     export MAX_IMAGES
@@ -1352,6 +1486,9 @@ run_renderer() {
     echo "Slang compiler        : $SLANGC_BIN"
     echo "Native distortion    : $USE_NATIVE_DISTORTION"
     echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
+    echo "Safe 3DGUT renderer  : $SAFE_3DGUT_RENDER"
+    echo "Torch extension dir  : $TORCH_EXTENSIONS_DIR"
+    echo "Ninja workers        : $MAX_JOBS"
     echo "Evaluation           : $ENABLE_EVALUATION"
     echo "LPIPS                : $LPIPS_NET"
     echo "Overwrite renders    : $OVERWRITE_RENDER"
