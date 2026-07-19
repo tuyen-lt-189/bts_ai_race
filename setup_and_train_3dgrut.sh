@@ -62,7 +62,10 @@ export UV_PYTHON="${UV_PYTHON:-$VENV_DIR/bin/python}"
 export PATH="$VENV_DIR/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
 
-AUTO_INSTALL_SLANGC="${AUTO_INSTALL_SLANGC:-true}"
+# Slang compiler installed by the official 3DGRUT environment setup.
+# Keep this as an absolute path because 3DGRUT launches `slangc` from a
+# Python subprocess while building the 3DGUT plugin.
+SLANGC_BIN="${SLANGC_BIN:-$VENV_DIR/bin/slangc}"
 SLANGC_EXPECTED_VERSION="${SLANGC_EXPECTED_VERSION:-2026.5.2}"
 
 # Physical GPU on the server. It becomes logical cuda:0 in Python.
@@ -259,6 +262,7 @@ check_runtime() {
     echo "[Runtime] Venv          : $VENV_DIR"
     echo "[Runtime] Python        : $(command -v python)"
     echo "[Runtime] PATH head     : ${PATH%%:*}"
+    echo "[Runtime] Slang target  : $SLANGC_BIN"
 
     command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable."
     [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die "GPU_ID must be an integer."
@@ -290,71 +294,80 @@ PYVERIFY
 }
 
 ensure_slangc() {
-    local slangc_path=""
     local actual_version=""
-    local installer="$REPO_DIR/scripts/install_slangc.sh"
 
+    [[ -f "$SLANGC_BIN" ]] || die \
+        "slangc file is missing: $SLANGC_BIN
+Install only this component with:
+  cd $REPO_DIR
+  source $VENV_DIR/bin/activate
+  export UV_PROJECT_ENVIRONMENT=$VENV_DIR
+  bash scripts/install_slangc.sh"
+
+    [[ -x "$SLANGC_BIN" ]] || die \
+        "slangc exists but is not executable: $SLANGC_BIN
+Run:
+  chmod +x $SLANGC_BIN"
+
+    # setup_3dgut.py invokes the literal command `slangc`.
+    export PATH="$(dirname "$SLANGC_BIN"):$PATH"
+    export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
     hash -r
-    slangc_path="$(command -v slangc 2>/dev/null || true)"
 
-    if [[ -z "$slangc_path" && -x "$VENV_DIR/bin/slangc" ]]; then
-        export PATH="$VENV_DIR/bin:$PATH"
-        hash -r
-        slangc_path="$(command -v slangc 2>/dev/null || true)"
+    local resolved_slangc
+    resolved_slangc="$(command -v slangc 2>/dev/null || true)"
+    [[ -n "$resolved_slangc" ]] || die \
+        "slangc exists but cannot be resolved through PATH."
+
+    [[ "$(readlink -f "$resolved_slangc")" == "$(readlink -f "$SLANGC_BIN")" ]] || die \
+        "PATH resolves a different slangc:
+  expected: $SLANGC_BIN
+  resolved: $resolved_slangc"
+
+    if ! actual_version="$("$SLANGC_BIN" -version 2>&1 | head -n 1 | tr -d '\r')"; then
+        die \
+            "slangc exists but cannot run: $SLANGC_BIN
+Check shared libraries with:
+  ldd $SLANGC_BIN | grep 'not found'"
     fi
 
-    if [[ -z "$slangc_path" ]]; then
-        [[ "$AUTO_INSTALL_SLANGC" == "true" ]] || die \
-            "slangc was not found. Set AUTO_INSTALL_SLANGC=true or install it into $VENV_DIR/bin."
-
-        [[ -f "$installer" ]] || die \
-            "Official Slang installer not found: $installer"
-
-        command -v wget >/dev/null 2>&1 || die \
-            "wget is required by install_slangc.sh. Install it with: sudo apt install -y wget"
-
-        echo "[Slang] slangc is missing; running the official installer..."
-        (
-            cd "$REPO_DIR"
-            export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
-            export PATH="$VENV_DIR/bin:$PATH"
-            bash "$installer"
-        )
-
-        export PATH="$VENV_DIR/bin:$PATH"
-        hash -r
-        slangc_path="$(command -v slangc 2>/dev/null || true)"
-    fi
-
-    [[ -n "$slangc_path" && -x "$slangc_path" ]] || die \
-        "slangc is still unavailable. Expected: $VENV_DIR/bin/slangc"
-
-    actual_version="$("$slangc_path" -version 2>&1 | head -n 1 | tr -d '\r')"
-
-    echo "[Slang] Executable     : $slangc_path"
+    echo "[Slang] Executable     : $SLANGC_BIN"
+    echo "[Slang] PATH resolved  : $resolved_slangc"
     echo "[Slang] Version        : $actual_version"
     echo "[Slang] Expected       : $SLANGC_EXPECTED_VERSION"
 
-    [[ "$actual_version" == "$SLANGC_EXPECTED_VERSION" ]] || die \
-        "Unexpected slangc version. Expected $SLANGC_EXPECTED_VERSION, got: $actual_version"
+    if [[ "$actual_version" != "$SLANGC_EXPECTED_VERSION" ]]; then
+        echo "WARNING: slangc version differs from the repository-pinned version." >&2
+        echo "WARNING: render will continue because the compiler is runnable." >&2
+    fi
 
-    "$VENV_DIR/bin/python" - <<'PYSLANG'
+    SLANGC_BIN="$SLANGC_BIN" "$VENV_DIR/bin/python" - <<'PYSLANG'
+import os
+import pathlib
 import shutil
 import subprocess
 
-path = shutil.which("slangc")
-if not path:
+expected = pathlib.Path(os.environ["SLANGC_BIN"]).resolve()
+resolved_raw = shutil.which("slangc")
+if not resolved_raw:
     raise SystemExit("Python subprocess environment cannot resolve slangc.")
+
+resolved = pathlib.Path(resolved_raw).resolve()
+if resolved != expected:
+    raise SystemExit(
+        f"Python resolved a different slangc: expected={expected}, resolved={resolved}"
+    )
+
 version = subprocess.check_output(
     ["slangc", "-version"],
     text=True,
     stderr=subprocess.STDOUT,
 ).strip()
-print("[Slang] Python lookup   :", path)
+
+print("[Slang] Python lookup   :", resolved)
 print("[Slang] Subprocess test :", version)
 PYSLANG
 }
-
 
 patch_tcnn_jit_control() {
     local feature_file="$REPO_DIR/threedgrut/model/feature_decoder.py"
@@ -1336,7 +1349,7 @@ run_renderer() {
     echo "Physical GPU         : $GPU_ID"
     echo "PyTorch device       : cuda:0"
     echo "Venv                  : $VENV_DIR"
-    echo "Slang compiler        : $(command -v slangc)"
+    echo "Slang compiler        : $SLANGC_BIN"
     echo "Native distortion    : $USE_NATIVE_DISTORTION"
     echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
     echo "Evaluation           : $ENABLE_EVALUATION"
@@ -1364,7 +1377,7 @@ echo "Repository       : $REPO_DIR"
 echo "Venv             : $VENV_DIR"
 echo "Scene            : $SCENE_NAME"
 echo "Physical GPU     : $GPU_ID"
-echo "Auto slangc      : $AUTO_INSTALL_SLANGC"
+echo "Slang compiler   : $SLANGC_BIN"
 echo "============================================================"
 
 check_runtime
