@@ -68,11 +68,15 @@ export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
 SLANGC_BIN="${SLANGC_BIN:-$VENV_DIR/bin/slangc}"
 SLANGC_EXPECTED_VERSION="${SLANGC_EXPECTED_VERSION:-2026.5.2}"
 
-# Physical GPU on the server. It becomes logical cuda:0 in Python.
-GPU_ID="${GPU_ID:-1}"
-export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
-export CUDA_VISIBLE_DEVICES="$GPU_ID"
-export PHYSICAL_GPU_ID="$GPU_ID"
+# HARD GPU LOCK
+# Always use physical GPU 1. After CUDA_VISIBLE_DEVICES=1, PyTorch exposes
+# that physical device as logical cuda:0 inside the process.
+unset CUDA_VISIBLE_DEVICES
+unset CUDA_DEVICE_ORDER
+readonly GPU_ID=1
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=1
+export PHYSICAL_GPU_ID=1
 
 APPEARANCE_MODE="${APPEARANCE_MODE:-native_distortion}"
 MAX_STEPS="${MAX_STEPS:-35000}"
@@ -285,27 +289,67 @@ check_runtime() {
     nvidia-smi -i "$GPU_ID" --query-gpu=index --format=csv,noheader,nounits \
         >/dev/null 2>&1 || die "Physical GPU $GPU_ID is unavailable."
 
-    echo "[GPU] Selected physical GPU: $GPU_ID"
-    nvidia-smi -i "$GPU_ID" \
-        --query-gpu=index,name,memory.total,memory.used,memory.free \
+    echo "[GPU] HARD-LOCK physical GPU: 1"
+    EXPECTED_GPU_UUID="$(
+        nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader,nounits | head -n 1 | tr -d '\r'
+    )"
+    export EXPECTED_GPU_UUID
+
+    nvidia-smi -i 1 \
+        --query-gpu=index,uuid,pci.bus_id,name,memory.total,memory.used,memory.free \
         --format=csv,noheader
 
-    CUDA_VISIBLE_DEVICES="$GPU_ID" "$VENV_DIR/bin/python" - <<'PYVERIFY'
+    env \
+        CUDA_DEVICE_ORDER=PCI_BUS_ID \
+        CUDA_VISIBLE_DEVICES=1 \
+        PHYSICAL_GPU_ID=1 \
+        EXPECTED_GPU_UUID="$EXPECTED_GPU_UUID" \
+        "$VENV_DIR/bin/python" - <<'PYVERIFY'
 import os
+import subprocess
 import torch
 
 print("[Python] Version:", os.sys.version.split()[0])
 print("[PyTorch] Version:", torch.__version__)
 print("[PyTorch] CUDA:", torch.version.cuda)
 print("[PyTorch] CUDA available:", torch.cuda.is_available())
+print("[PyTorch] CUDA_DEVICE_ORDER:", os.environ.get("CUDA_DEVICE_ORDER"))
 print("[PyTorch] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("[PyTorch] Physical GPU requested:", os.environ.get("PHYSICAL_GPU_ID"))
+
+if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
+    raise SystemExit(
+        "GPU lock failed: CUDA_VISIBLE_DEVICES must be exactly '1'."
+    )
 if not torch.cuda.is_available():
-    raise SystemExit("PyTorch cannot access the selected GPU.")
+    raise SystemExit("PyTorch cannot access physical GPU 1.")
 if torch.cuda.device_count() != 1:
     raise SystemExit(
-        f"Expected exactly one visible GPU, got {torch.cuda.device_count()}."
+        f"GPU lock failed: expected one visible device, got {torch.cuda.device_count()}."
     )
-print("[PyTorch] Logical cuda:0:", torch.cuda.get_device_name(0))
+
+torch.cuda.set_device(0)
+logical_name = torch.cuda.get_device_name(0)
+selected_uuid = subprocess.check_output(
+    [
+        "nvidia-smi",
+        "-i",
+        os.environ["PHYSICAL_GPU_ID"],
+        "--query-gpu=uuid",
+        "--format=csv,noheader,nounits",
+    ],
+    text=True,
+).strip()
+expected_uuid = os.environ["EXPECTED_GPU_UUID"].strip()
+
+if selected_uuid != expected_uuid:
+    raise SystemExit(
+        f"GPU UUID verification failed: expected={expected_uuid}, selected={selected_uuid}"
+    )
+
+print("[PyTorch] Logical device:", torch.cuda.current_device())
+print("[PyTorch] Logical cuda:0:", logical_name)
+print("[PyTorch] Verified physical GPU UUID:", selected_uuid)
 PYVERIFY
 }
 
@@ -1448,6 +1492,19 @@ __RENDER_3DGRUT_V2_PY__
     echo "[Code] Embedded renderer created: $RENDER_LAUNCHER"
 }
 
+enforce_gpu_lock() {
+    if [[ "${GPU_ID:-1}" != "1" ]]; then
+        die "GPU_ID override is not allowed. This renderer is hard-locked to physical GPU 1."
+    fi
+
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES=1
+    export PHYSICAL_GPU_ID=1
+
+    echo "[GPU] Lock active: physical GPU 1 -> PyTorch logical cuda:0"
+}
+
+
 run_renderer() {
     export SCENE_NAME
     export APPEARANCE_MODE
@@ -1480,7 +1537,7 @@ run_renderer() {
     echo "Experiment directory : $EXPERIMENT_DIR"
     echo "Checkpoint request   : $CHECKPOINT_STEP"
     echo "Checkpoint path      : ${CHECKPOINT_PATH:-auto}"
-    echo "Physical GPU         : $GPU_ID"
+    echo "Physical GPU         : 1 (hard-locked)"
     echo "PyTorch device       : cuda:0"
     echo "Venv                  : $VENV_DIR"
     echo "Slang compiler        : $SLANGC_BIN"
@@ -1498,7 +1555,11 @@ run_renderer() {
     echo
 
     cd "$REPO_DIR"
-    "$VENV_DIR/bin/python" "$RENDER_LAUNCHER"
+    env \
+        CUDA_DEVICE_ORDER=PCI_BUS_ID \
+        CUDA_VISIBLE_DEVICES=1 \
+        PHYSICAL_GPU_ID=1 \
+        "$VENV_DIR/bin/python" "$RENDER_LAUNCHER"
 }
 
 # =============================================================================
@@ -1513,10 +1574,11 @@ echo "AI Tuyen root    : $AI_TUYEN_ROOT"
 echo "Repository       : $REPO_DIR"
 echo "Venv             : $VENV_DIR"
 echo "Scene            : $SCENE_NAME"
-echo "Physical GPU     : $GPU_ID"
+echo "Physical GPU     : 1 (hard-locked)"
 echo "Slang compiler   : $SLANGC_BIN"
 echo "============================================================"
 
+enforce_gpu_lock
 check_runtime
 ensure_slangc
 prepare_dataset_view
