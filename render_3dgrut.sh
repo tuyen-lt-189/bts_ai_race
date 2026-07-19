@@ -53,6 +53,20 @@ DATASET_SOURCE="${DATASET_SOURCE:-}"
 WORK_ROOT="${WORK_ROOT:-$AI_TUYEN_ROOT/3dgrut_workspace}"
 REPO_DIR="${REPO_DIR:-$WORK_ROOT/3dgrut}"
 OUT_ROOT="${OUT_ROOT:-$REPO_DIR/runs}"
+VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv}"
+
+# The official installer places slangc in .venv/bin. Rendering uses Python
+# through an absolute path, so explicitly expose the whole environment too.
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$VENV_DIR}"
+export UV_PYTHON="${UV_PYTHON:-$VENV_DIR/bin/python}"
+export PATH="$VENV_DIR/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
+
+# Slang compiler installed by the official 3DGRUT environment setup.
+# Keep this as an absolute path because 3DGRUT launches `slangc` from a
+# Python subprocess while building the 3DGUT plugin.
+SLANGC_BIN="${SLANGC_BIN:-$VENV_DIR/bin/slangc}"
+SLANGC_EXPECTED_VERSION="${SLANGC_EXPECTED_VERSION:-2026.5.2}"
 
 # Physical GPU on the server. It becomes logical cuda:0 in Python.
 GPU_ID="${GPU_ID:-1}"
@@ -232,10 +246,23 @@ prepare_dataset_view() {
 check_runtime() {
     [[ -d "$REPO_DIR/.git" ]] || die \
         "3DGRUT repository not found at $REPO_DIR. Run setup_and_train_3dgrut.sh first."
-    [[ -x "$REPO_DIR/.venv/bin/python" ]] || die \
-        "3DGRUT .venv not found at $REPO_DIR/.venv. Run training setup first."
+    [[ -x "$VENV_DIR/bin/python" ]] || die \
+        "3DGRUT .venv not found at $VENV_DIR. Run training setup first."
     [[ -f "$REPO_DIR/render.py" ]] || die \
         "Invalid 3DGRUT repository: $REPO_DIR/render.py is missing."
+
+    # Restore PATH and compiler variables persisted by install_env_uv.sh.
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+    export UV_PYTHON="$VENV_DIR/bin/python"
+    export PATH="$VENV_DIR/bin:$PATH"
+    hash -r
+
+    echo "[Runtime] Venv          : $VENV_DIR"
+    echo "[Runtime] Python        : $(command -v python)"
+    echo "[Runtime] PATH head     : ${PATH%%:*}"
+    echo "[Runtime] Slang target  : $SLANGC_BIN"
 
     command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable."
     [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die "GPU_ID must be an integer."
@@ -247,7 +274,7 @@ check_runtime() {
         --query-gpu=index,name,memory.total,memory.used,memory.free \
         --format=csv,noheader
 
-    CUDA_VISIBLE_DEVICES="$GPU_ID" "$REPO_DIR/.venv/bin/python" - <<'PYVERIFY'
+    CUDA_VISIBLE_DEVICES="$GPU_ID" "$VENV_DIR/bin/python" - <<'PYVERIFY'
 import os
 import torch
 
@@ -266,11 +293,87 @@ print("[PyTorch] Logical cuda:0:", torch.cuda.get_device_name(0))
 PYVERIFY
 }
 
+ensure_slangc() {
+    local actual_version=""
+
+    [[ -f "$SLANGC_BIN" ]] || die \
+        "slangc file is missing: $SLANGC_BIN
+Install only this component with:
+  cd $REPO_DIR
+  source $VENV_DIR/bin/activate
+  export UV_PROJECT_ENVIRONMENT=$VENV_DIR
+  bash scripts/install_slangc.sh"
+
+    [[ -x "$SLANGC_BIN" ]] || die \
+        "slangc exists but is not executable: $SLANGC_BIN
+Run:
+  chmod +x $SLANGC_BIN"
+
+    # setup_3dgut.py invokes the literal command `slangc`.
+    export PATH="$(dirname "$SLANGC_BIN"):$PATH"
+    export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
+    hash -r
+
+    local resolved_slangc
+    resolved_slangc="$(command -v slangc 2>/dev/null || true)"
+    [[ -n "$resolved_slangc" ]] || die \
+        "slangc exists but cannot be resolved through PATH."
+
+    [[ "$(readlink -f "$resolved_slangc")" == "$(readlink -f "$SLANGC_BIN")" ]] || die \
+        "PATH resolves a different slangc:
+  expected: $SLANGC_BIN
+  resolved: $resolved_slangc"
+
+    if ! actual_version="$("$SLANGC_BIN" -version 2>&1 | head -n 1 | tr -d '\r')"; then
+        die \
+            "slangc exists but cannot run: $SLANGC_BIN
+Check shared libraries with:
+  ldd $SLANGC_BIN | grep 'not found'"
+    fi
+
+    echo "[Slang] Executable     : $SLANGC_BIN"
+    echo "[Slang] PATH resolved  : $resolved_slangc"
+    echo "[Slang] Version        : $actual_version"
+    echo "[Slang] Expected       : $SLANGC_EXPECTED_VERSION"
+
+    if [[ "$actual_version" != "$SLANGC_EXPECTED_VERSION" ]]; then
+        echo "WARNING: slangc version differs from the repository-pinned version." >&2
+        echo "WARNING: render will continue because the compiler is runnable." >&2
+    fi
+
+    SLANGC_BIN="$SLANGC_BIN" "$VENV_DIR/bin/python" - <<'PYSLANG'
+import os
+import pathlib
+import shutil
+import subprocess
+
+expected = pathlib.Path(os.environ["SLANGC_BIN"]).resolve()
+resolved_raw = shutil.which("slangc")
+if not resolved_raw:
+    raise SystemExit("Python subprocess environment cannot resolve slangc.")
+
+resolved = pathlib.Path(resolved_raw).resolve()
+if resolved != expected:
+    raise SystemExit(
+        f"Python resolved a different slangc: expected={expected}, resolved={resolved}"
+    )
+
+version = subprocess.check_output(
+    ["slangc", "-version"],
+    text=True,
+    stderr=subprocess.STDOUT,
+).strip()
+
+print("[Slang] Python lookup   :", resolved)
+print("[Slang] Subprocess test :", version)
+PYSLANG
+}
+
 patch_tcnn_jit_control() {
     local feature_file="$REPO_DIR/threedgrut/model/feature_decoder.py"
     [[ -f "$feature_file" ]] || die "Feature decoder not found: $feature_file"
 
-    "$REPO_DIR/.venv/bin/python" - "$feature_file" <<'PYPATCH'
+    "$VENV_DIR/bin/python" - "$feature_file" <<'PYPATCH'
 from pathlib import Path
 import py_compile
 import sys
@@ -1208,7 +1311,7 @@ if __name__ == "__main__":
 __RENDER_3DGRUT_V2_PY__
 
     chmod +x "$RENDER_LAUNCHER"
-    "$REPO_DIR/.venv/bin/python" -m py_compile "$RENDER_LAUNCHER"
+    "$VENV_DIR/bin/python" -m py_compile "$RENDER_LAUNCHER"
     echo "[Code] Embedded renderer created: $RENDER_LAUNCHER"
 }
 
@@ -1245,6 +1348,8 @@ run_renderer() {
     echo "Checkpoint path      : ${CHECKPOINT_PATH:-auto}"
     echo "Physical GPU         : $GPU_ID"
     echo "PyTorch device       : cuda:0"
+    echo "Venv                  : $VENV_DIR"
+    echo "Slang compiler        : $SLANGC_BIN"
     echo "Native distortion    : $USE_NATIVE_DISTORTION"
     echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
     echo "Evaluation           : $ENABLE_EVALUATION"
@@ -1256,7 +1361,7 @@ run_renderer() {
     echo
 
     cd "$REPO_DIR"
-    "$REPO_DIR/.venv/bin/python" "$RENDER_LAUNCHER"
+    "$VENV_DIR/bin/python" "$RENDER_LAUNCHER"
 }
 
 # =============================================================================
@@ -1269,11 +1374,14 @@ echo "============================================================"
 echo "Script directory : $SCRIPT_DIR"
 echo "AI Tuyen root    : $AI_TUYEN_ROOT"
 echo "Repository       : $REPO_DIR"
+echo "Venv             : $VENV_DIR"
 echo "Scene            : $SCENE_NAME"
 echo "Physical GPU     : $GPU_ID"
+echo "Slang compiler   : $SLANGC_BIN"
 echo "============================================================"
 
 check_runtime
+ensure_slangc
 prepare_dataset_view
 patch_tcnn_jit_control
 write_embedded_renderer
