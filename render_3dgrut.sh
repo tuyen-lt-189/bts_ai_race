@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One-file renderer for the matching 3DGRUT v2 training launcher.
+# Native 3DGUT renderer matching the 3DGRUT v2 training launcher.
 #
 # Expected layout:
 #
@@ -68,9 +68,8 @@ export LD_LIBRARY_PATH="$VENV_DIR/lib:$VENV_DIR/lib64:${LD_LIBRARY_PATH:-}"
 SLANGC_BIN="${SLANGC_BIN:-$VENV_DIR/bin/slangc}"
 SLANGC_EXPECTED_VERSION="${SLANGC_EXPECTED_VERSION:-2026.5.2}"
 
-# HARD GPU LOCK
-# Always use physical GPU 1. After CUDA_VISIBLE_DEVICES=1, PyTorch exposes
-# that physical device as logical cuda:0 inside the process.
+# HARD GPU LOCK:
+# Always use physical GPU 1. CUDA masks it as logical cuda:0 inside Python.
 unset CUDA_VISIBLE_DEVICES
 unset CUDA_DEVICE_ORDER
 readonly GPU_ID=1
@@ -83,6 +82,12 @@ MAX_STEPS="${MAX_STEPS:-35000}"
 CAP_MAX="${CAP_MAX:-2000000}"
 NHT_FEATURE_DIM="${NHT_FEATURE_DIM:-48}"
 RUN_NAME="${RUN_NAME:-${SCENE_NAME}_3dgrut_v2_3dgut_mcmc_nht_${APPEARANCE_MODE}_$((MAX_STEPS / 1000))k_$((CAP_MAX / 1000000))m_fd${NHT_FEATURE_DIM}}"
+
+# Use an isolated cache compiled from the exact checkpoint 3DGUT config.
+# This avoids reusing the earlier experimental 3DGRT/safe-culling extensions.
+TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/native_3dgut_${SCENE_NAME}_fd${NHT_FEATURE_DIM}}"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
+export TORCH_EXTENSIONS_DIR
 
 # last = newest ckpt_last.pt, or newest exact checkpoint if no last exists.
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-last}"
@@ -107,46 +112,16 @@ CONTINUE_ON_EVAL_ERROR="${CONTINUE_ON_EVAL_ERROR:-true}"
 TCNN_JIT_FUSION="${TCNN_JIT_FUSION:-0}"
 export TCNN_JIT_FUSION
 
-# Rendering backend:
-#   auto   : use 3DGRT for large 3DGUT checkpoints; otherwise keep checkpoint backend
-#   3dgrt  : force OptiX ray tracing while preserving Gaussian/NHT parameters
-#   3dgut  : force native 3DGUT rasterization
-#
-# The upstream 3DGUT rasterizer has a known cudaErrorIllegalAddress path with
-# large Gaussian clouds. This checkpoint has 2,000,000 Gaussians, so auto mode
-# switches inference to 3DGRT before constructing the renderer.
-RENDER_BACKEND="${RENDER_BACKEND:-auto}"
-AUTO_3DGRT_THRESHOLD="${AUTO_3DGRT_THRESHOLD:-200000}"
-SAFE_3DGUT_RENDER="${SAFE_3DGUT_RENDER:-true}"
-
-# Optional emergency fallback. 0 keeps all Gaussians. When set, the renderer
-# keeps the top-K Gaussians by raw density before model initialization.
-MAX_RENDER_GAUSSIANS="${MAX_RENDER_GAUSSIANS:-0}"
-
-MAX_JOBS="${MAX_JOBS:-4}"
-export RENDER_BACKEND
-export AUTO_3DGRT_THRESHOLD
-export SAFE_3DGUT_RENDER
-export MAX_RENDER_GAUSSIANS
-export MAX_JOBS
-
-case "$RENDER_BACKEND" in
-    auto|3dgrt|3dgut) ;;
-    *) die "RENDER_BACKEND must be auto, 3dgrt, or 3dgut." ;;
-esac
-
-[[ "$AUTO_3DGRT_THRESHOLD" =~ ^[0-9]+$ ]] || die     "AUTO_3DGRT_THRESHOLD must be a non-negative integer."
-[[ "$MAX_RENDER_GAUSSIANS" =~ ^[0-9]+$ ]] || die     "MAX_RENDER_GAUSSIANS must be a non-negative integer."
-
-TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$WORK_ROOT/torch_extensions/${SCENE_NAME}_fd${NHT_FEATURE_DIM}_${RENDER_BACKEND}}"
-mkdir -p "$TORCH_EXTENSIONS_DIR"
-export TORCH_EXTENSIONS_DIR
-
 # Preserve tqdm/Rich output while also writing a log.
 USE_PTY_LOGGING="${USE_PTY_LOGGING:-true}"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_ALLOC_CONF
 export PYTHONUNBUFFERED=1
+
+CUDA_DEBUG_SYNC="${CUDA_DEBUG_SYNC:-false}"
+if [[ "$CUDA_DEBUG_SYNC" == "true" ]]; then
+    export CUDA_LAUNCH_BLOCKING=1
+fi
 
 # =============================================================================
 # LOGGING
@@ -304,28 +279,17 @@ check_runtime() {
     echo "[Runtime] Slang target  : $SLANGC_BIN"
 
     command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable."
-    [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die "GPU_ID must be an integer."
-    nvidia-smi -i "$GPU_ID" --query-gpu=index --format=csv,noheader,nounits \
-        >/dev/null 2>&1 || die "Physical GPU $GPU_ID is unavailable."
+    nvidia-smi -i 1 --query-gpu=index --format=csv,noheader,nounits \
+        >/dev/null 2>&1 || die "Physical GPU 1 is unavailable."
 
-    echo "[GPU] HARD-LOCK physical GPU: 1"
-    EXPECTED_GPU_UUID="$(
-        nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader,nounits | head -n 1 | tr -d '\r'
-    )"
-    export EXPECTED_GPU_UUID
-
+    echo "[GPU] Hard-locked physical GPU: 1"
     nvidia-smi -i 1 \
         --query-gpu=index,uuid,pci.bus_id,name,memory.total,memory.used,memory.free \
         --format=csv,noheader
 
-    env \
-        CUDA_DEVICE_ORDER=PCI_BUS_ID \
-        CUDA_VISIBLE_DEVICES=1 \
-        PHYSICAL_GPU_ID=1 \
-        EXPECTED_GPU_UUID="$EXPECTED_GPU_UUID" \
+    env CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
         "$VENV_DIR/bin/python" - <<'PYVERIFY'
 import os
-import subprocess
 import torch
 
 print("[Python] Version:", os.sys.version.split()[0])
@@ -334,41 +298,19 @@ print("[PyTorch] CUDA:", torch.version.cuda)
 print("[PyTorch] CUDA available:", torch.cuda.is_available())
 print("[PyTorch] CUDA_DEVICE_ORDER:", os.environ.get("CUDA_DEVICE_ORDER"))
 print("[PyTorch] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
-print("[PyTorch] Physical GPU requested:", os.environ.get("PHYSICAL_GPU_ID"))
 
 if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
-    raise SystemExit(
-        "GPU lock failed: CUDA_VISIBLE_DEVICES must be exactly '1'."
-    )
+    raise SystemExit("GPU lock failed: CUDA_VISIBLE_DEVICES must be 1.")
 if not torch.cuda.is_available():
     raise SystemExit("PyTorch cannot access physical GPU 1.")
 if torch.cuda.device_count() != 1:
     raise SystemExit(
-        f"GPU lock failed: expected one visible device, got {torch.cuda.device_count()}."
+        f"Expected exactly one visible GPU, got {torch.cuda.device_count()}."
     )
 
 torch.cuda.set_device(0)
-logical_name = torch.cuda.get_device_name(0)
-selected_uuid = subprocess.check_output(
-    [
-        "nvidia-smi",
-        "-i",
-        os.environ["PHYSICAL_GPU_ID"],
-        "--query-gpu=uuid",
-        "--format=csv,noheader,nounits",
-    ],
-    text=True,
-).strip()
-expected_uuid = os.environ["EXPECTED_GPU_UUID"].strip()
-
-if selected_uuid != expected_uuid:
-    raise SystemExit(
-        f"GPU UUID verification failed: expected={expected_uuid}, selected={selected_uuid}"
-    )
-
 print("[PyTorch] Logical device:", torch.cuda.current_device())
-print("[PyTorch] Logical cuda:0:", logical_name)
-print("[PyTorch] Verified physical GPU UUID:", selected_uuid)
+print("[PyTorch] Logical cuda:0:", torch.cuda.get_device_name(0))
 PYVERIFY
 }
 
@@ -621,11 +563,6 @@ GPU_ID = int(os.environ.get("RENDER_LOGICAL_GPU_ID", "0"))
 CAMERA_ID = env_optional_int("CAMERA_ID")
 USE_NATIVE_DISTORTION = env_bool("USE_NATIVE_DISTORTION", True)
 USE_FEATURE_DECODER_EMA = env_bool("USE_FEATURE_DECODER_EMA", True)
-SAFE_3DGUT_RENDER = env_bool("SAFE_3DGUT_RENDER", True)
-
-RENDER_BACKEND = os.environ.get("RENDER_BACKEND", "auto").strip().lower()
-AUTO_3DGRT_THRESHOLD = int(os.environ.get("AUTO_3DGRT_THRESHOLD", "200000"))
-MAX_RENDER_GAUSSIANS = int(os.environ.get("MAX_RENDER_GAUSSIANS", "0"))
 
 LPIPS_NET = os.environ.get("LPIPS_NET", "vgg").strip().lower()
 PSNR_MAX = float(os.environ.get("PSNR_MAX", "40.0"))
@@ -1012,194 +949,98 @@ def load_feature_decoder(
     return decoder, state_name
 
 
-def _mutate_render_config(conf: Any, callback: Any) -> None:
-    """Temporarily unlock OmegaConf, apply a mutation, then restore readonly."""
-    try:
-        from omegaconf import OmegaConf
+def move_model_to_render_device(
+    model: MixtureOfGaussians,
+    device: torch.device,
+) -> dict[str, dict[str, Any]]:
+    """
+    Move only the model tensors to CUDA.
 
-        was_readonly = bool(OmegaConf.is_readonly(conf))
-        if was_readonly:
-            OmegaConf.set_readonly(conf, False)
-        callback()
-        if was_readonly:
-            OmegaConf.set_readonly(conf, True)
-    except Exception:
-        callback()
+    The checkpoint stays on CPU so optimizer state does not consume render VRAM.
+    init_from_checkpoint() assigns checkpoint tensors directly to the model, so
+    an explicit model.to(device) is required before the native CUDA renderer.
+    """
+    model.to(device)
+    model.requires_grad_(False)
 
-
-def configure_render_backend(conf: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
-    original_backend = str(conf.render.method).strip().lower()
-    checkpoint_gaussians = int(checkpoint["positions"].shape[0])
-
-    if RENDER_BACKEND not in {"auto", "3dgrt", "3dgut"}:
-        fail("RENDER_BACKEND must be auto, 3dgrt, or 3dgut.")
-
-    if RENDER_BACKEND == "auto":
-        if original_backend == "3dgut" and checkpoint_gaussians > AUTO_3DGRT_THRESHOLD:
-            effective_backend = "3dgrt"
-            reason = (
-                f"3DGUT checkpoint has {checkpoint_gaussians:,} Gaussians, "
-                f"above auto threshold {AUTO_3DGRT_THRESHOLD:,}"
-            )
-        else:
-            effective_backend = original_backend
-            reason = "checkpoint backend is below the auto-switch threshold"
-    else:
-        effective_backend = RENDER_BACKEND
-        reason = "explicit backend request"
-
-    def apply_backend() -> None:
-        conf.render.method = effective_backend
-        if effective_backend == "3dgut" and SAFE_3DGUT_RENDER:
-            conf.render.splat.rect_bounding = False
-            conf.render.splat.tight_opacity_bounding = False
-            conf.render.splat.tile_based_culling = False
-
-    _mutate_render_config(conf, apply_backend)
-
-    effective_culling: dict[str, bool] | None = None
-    if effective_backend == "3dgut":
-        splat = conf.render.splat
-        effective_culling = {
-            "rect_bounding": bool(splat.rect_bounding),
-            "tight_opacity_bounding": bool(splat.tight_opacity_bounding),
-            "tile_based_culling": bool(splat.tile_based_culling),
-        }
-
-    info = {
-        "requested_backend": RENDER_BACKEND,
-        "original_backend": original_backend,
-        "effective_backend": effective_backend,
-        "switch_reason": reason,
-        "checkpoint_gaussians": checkpoint_gaussians,
-        "effective_culling": effective_culling,
-    }
-
-    print("[Renderer] Requested       :", RENDER_BACKEND)
-    print("[Renderer] Checkpoint      :", original_backend)
-    print("[Renderer] Effective       :", effective_backend)
-    print("[Renderer] Reason          :", reason)
-    print("[Renderer] Gaussian count  :", f"{checkpoint_gaussians:,}")
-    print("[Renderer] 3DGUT culling   :", effective_culling)
-    print("[Renderer] Extension cache :", os.environ.get("TORCH_EXTENSIONS_DIR", "default"))
-    return info
-
-
-def limit_checkpoint_gaussians(
-    checkpoint: dict[str, Any],
-    max_gaussians: int,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Optionally retain top-K Gaussian parameter rows by raw density."""
-    original_count = int(checkpoint["positions"].shape[0])
-    if max_gaussians <= 0 or max_gaussians >= original_count:
-        return checkpoint, {
-            "original_count": original_count,
-            "render_count": original_count,
-            "limited": False,
-        }
-
-    density = checkpoint["density"].detach().reshape(-1)
-    keep = torch.topk(
-        density,
-        k=max_gaussians,
-        largest=True,
-        sorted=False,
-    ).indices
-    keep = torch.sort(keep).values
-
-    reduced = dict(checkpoint)
-    parameter_fields = (
+    tensor_names = [
         "positions",
         "rotation",
         "scale",
         "density",
-        "features",
-        "features_albedo",
-        "features_specular",
-    )
+    ]
+    if hasattr(model, "features"):
+        tensor_names.append("features")
+    if hasattr(model, "features_albedo"):
+        tensor_names.append("features_albedo")
+    if hasattr(model, "features_specular"):
+        tensor_names.append("features_specular")
 
-    for field in parameter_fields:
-        value = checkpoint.get(field)
-        if value is None:
+    report: dict[str, dict[str, Any]] = {}
+    for name in tensor_names:
+        tensor = getattr(model, name, None)
+        if tensor is None:
             continue
-        if not isinstance(value, torch.Tensor):
-            continue
-        if value.ndim == 0 or int(value.shape[0]) != original_count:
-            continue
-        selected = value.detach().index_select(0, keep).contiguous()
-        reduced[field] = torch.nn.Parameter(selected, requires_grad=False)
 
-    print(
-        "[Renderer] Gaussian limit :",
-        f"{original_count:,} -> {max_gaussians:,} (top raw density)",
-    )
-    return reduced, {
-        "original_count": original_count,
-        "render_count": max_gaussians,
-        "limited": True,
-    }
+        # Keep the storage contiguous before it is passed to the native plugin.
+        if isinstance(tensor, torch.nn.Parameter):
+            if not tensor.data.is_contiguous():
+                tensor.data = tensor.data.contiguous()
+        elif isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+            setattr(model, name, tensor)
 
+        tensor = getattr(model, name)
+        report[name] = {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "is_cuda": bool(tensor.is_cuda),
+            "contiguous": bool(tensor.is_contiguous()),
+        }
 
-def validate_first_batch(record: dict[str, Any], batch: Batch, device: torch.device) -> None:
-    """Fail before entering the CUDA renderer when camera data is malformed."""
-    if record["width"] <= 0 or record["height"] <= 0:
-        fail("Invalid render resolution.")
-    if record["fx"] <= 0 or record["fy"] <= 0:
-        fail("Camera focal lengths must be positive.")
-
-    tensors = {
-        "rays_ori": batch.rays_ori,
-        "rays_dir": batch.rays_dir,
-        "T_to_world": batch.T_to_world,
-        "pixel_coords": batch.pixel_coords,
-    }
-    for name, tensor in tensors.items():
-        if not torch.isfinite(tensor).all().item():
-            fail(f"Non-finite values found in {name}.")
+        if not tensor.is_cuda:
+            fail(
+                f"Model tensor {name!r} is still on {tensor.device}; "
+                f"native 3DGUT requires CUDA tensors."
+            )
+        if tensor.device.index != device.index:
+            fail(
+                f"Model tensor {name!r} is on {tensor.device}, expected {device}."
+            )
         if not tensor.is_contiguous():
-            tensors[name] = tensor.contiguous()
+            fail(f"Model tensor {name!r} is not contiguous.")
 
-    rotation = batch.T_to_world[0, :3, :3]
-    determinant = float(torch.linalg.det(rotation).item())
-    translation = batch.T_to_world[0, :3, 3].detach().cpu().tolist()
+    if not report:
+        fail("No Gaussian parameter tensors were found after checkpoint loading.")
 
-    h = int(record["height"])
-    w = int(record["width"])
-    sy = max(h // 32, 1)
-    sx = max(w // 32, 1)
-    sampled_dirs = batch.rays_dir[0, ::sy, ::sx]
-    ray_norms = torch.linalg.norm(sampled_dirs, dim=-1)
+    background_parameters = list(model.background.parameters())
+    for parameter in background_parameters:
+        if not parameter.is_cuda or parameter.device.index != device.index:
+            fail(
+                f"Background parameter is on {parameter.device}, expected {device}."
+            )
 
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-
-    print("[Camera] First image      :", record["image_name"])
-    print("[Camera] Resolution       :", f"{w}x{h}")
-    print(
-        "[Camera] Intrinsics       :",
-        {
-            "fx": record["fx"],
-            "fy": record["fy"],
-            "cx": record["cx"],
-            "cy": record["cy"],
-        },
-    )
-    print("[Camera] C2W translation  :", translation)
-    print("[Camera] Rotation det     :", f"{determinant:.8f}")
-    print(
-        "[Camera] Ray norm sample :",
-        f"min={float(ray_norms.min().item()):.8f}, "
-        f"max={float(ray_norms.max().item()):.8f}",
-    )
-    for name, tensor in tensors.items():
+    print("[Model] CUDA tensor verification:")
+    for name, info in report.items():
         print(
-            f"[Camera] {name:<17}:",
-            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-            f"device={tensor.device}, contiguous={tensor.is_contiguous()}",
+            f"[Model]   {name:<20} "
+            f"shape={info['shape']}, dtype={info['dtype']}, "
+            f"device={info['device']}, contiguous={info['contiguous']}"
         )
+    return report
+
+
+def cuda_memory_line(device: torch.device, label: str) -> None:
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
     print(
-        "[CUDA] Memory before render:",
+        f"[CUDA] {label}: "
         f"free={free_bytes / 1024**3:.2f} GiB, "
-        f"total={total_bytes / 1024**3:.2f} GiB",
+        f"total={total_bytes / 1024**3:.2f} GiB, "
+        f"allocated={allocated / 1024**3:.2f} GiB, "
+        f"reserved={reserved / 1024**3:.2f} GiB"
     )
 
 
@@ -1207,45 +1048,49 @@ def load_model(
     checkpoint_path: Path,
     device: torch.device,
 ) -> tuple[MixtureOfGaussians, FeatureDecoder | None, Any | None, Any, dict[str, Any]]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # Keep the full checkpoint and optimizer state on CPU. Only model tensors
+    # are moved to CUDA after init_from_checkpoint().
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
     if "config" not in checkpoint:
         fail(f"Checkpoint has no config: {checkpoint_path}")
 
     conf = checkpoint["config"]
-    original_backend = str(conf.render.method).strip().lower()
-    if original_backend not in {"3dgut", "3dgrt"}:
-        fail(f"Unsupported checkpoint render.method={conf.render.method}")
+    checkpoint_backend = str(conf.render.method)
+    if checkpoint_backend != "3dgut":
+        fail(
+            f"Expected a native 3DGUT checkpoint, got "
+            f"render.method={checkpoint_backend}"
+        )
 
-    backend_info = configure_render_backend(conf, checkpoint)
-    checkpoint_for_render, limit_info = limit_checkpoint_gaussians(
-        checkpoint,
-        MAX_RENDER_GAUSSIANS,
-    )
+    print("[Model] Checkpoint backend : native 3DGUT")
+    print("[Model] Checkpoint load    : CPU")
+    print("[Model] Render device      :", device)
+    print("[Model] Extension cache    :", os.environ.get("TORCH_EXTENSIONS_DIR", "default"))
 
-    print(
-        "[Renderer] Constructing   :",
-        f"MixtureOfGaussians(method={backend_info['effective_backend']})",
-    )
+    cuda_memory_line(device, "before model construction")
+
+    # Construct the exact backend/config used during training.
     model = MixtureOfGaussians(conf)
-    model.init_from_checkpoint(checkpoint_for_render, setup_optimizer=False)
+    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+
+    # Critical fix: init_from_checkpoint assigns checkpoint tensors directly.
+    # Since the checkpoint was loaded on CPU, explicitly move all registered
+    # Gaussian/NHT parameters and the background to the render CUDA device.
+    tensor_report = move_model_to_render_device(model, device)
     model.eval()
 
-    torch.cuda.empty_cache()
-    free_before, total_bytes = torch.cuda.mem_get_info(device)
-    print(
-        "[Renderer] Build ACC      :",
-        f"backend={backend_info['effective_backend']}, "
-        f"gaussians={model.num_gaussians:,}, "
-        f"free={free_before / 1024**3:.2f} GiB",
-    )
+    cuda_memory_line(device, "after model tensors moved")
+
+    # Native 3DGUT currently has no OptiX BVH, but call the common API to match
+    # the official renderer and future repository changes.
     model.build_acc()
     torch.cuda.synchronize(device)
-    free_after, _ = torch.cuda.mem_get_info(device)
-    print(
-        "[Renderer] ACC ready      :",
-        f"used={(free_before - free_after) / 1024**3:.2f} GiB, "
-        f"free={free_after / 1024**3:.2f} GiB",
-    )
+
+    cuda_memory_line(device, "after build_acc")
 
     decoder, decoder_state = load_feature_decoder(
         checkpoint,
@@ -1253,29 +1098,40 @@ def load_model(
         model,
         device,
     )
-    post_processing = load_post_processing(checkpoint, conf, device)
+    post_processing = load_post_processing(
+        checkpoint,
+        conf,
+        device,
+    )
+
+    # Release CPU-only optimizer/checkpoint tensors before rendering.
+    checkpoint_gaussians = int(checkpoint["positions"].shape[0])
+    global_step = int(
+        checkpoint.get(
+            "global_step",
+            checkpoint_step_from_path(checkpoint_path),
+        )
+    )
+    feature_type = str(checkpoint.get("feature_type", "unknown"))
+    particle_feature_dim = int(
+        checkpoint.get("particle_feature_dim", -1)
+    )
+    ray_feature_dim = int(
+        checkpoint.get("ray_feature_dim", -1)
+    )
+    del checkpoint
 
     meta = {
-        "global_step": int(
-            checkpoint.get(
-                "global_step",
-                checkpoint_step_from_path(checkpoint_path),
-            )
-        ),
+        "global_step": global_step,
         "num_gaussians": int(model.num_gaussians),
-        "checkpoint_num_gaussians": int(limit_info["original_count"]),
-        "gaussians_limited": bool(limit_info["limited"]),
-        "feature_type": str(checkpoint.get("feature_type", "unknown")),
-        "particle_feature_dim": int(checkpoint.get("particle_feature_dim", -1)),
-        "ray_feature_dim": int(checkpoint.get("ray_feature_dim", -1)),
+        "checkpoint_num_gaussians": checkpoint_gaussians,
+        "feature_type": feature_type,
+        "particle_feature_dim": particle_feature_dim,
+        "ray_feature_dim": ray_feature_dim,
         "decoder_state": decoder_state,
         "post_processing": str(conf.post_processing.method),
-        "requested_backend": backend_info["requested_backend"],
-        "original_backend": backend_info["original_backend"],
-        "render_backend": backend_info["effective_backend"],
-        "backend_reason": backend_info["switch_reason"],
-        "safe_3dgut_render": SAFE_3DGUT_RENDER,
-        "effective_culling": backend_info["effective_culling"],
+        "renderer": "native_3dgut",
+        "tensor_devices": tensor_report,
     }
     return model, decoder, post_processing, conf, meta
 
@@ -1486,11 +1342,7 @@ def main() -> None:
     model, decoder, post_processing, conf, meta = load_model(checkpoint_path, device)
 
     effective_step = int(meta["global_step"])
-    render_tag = (
-        f"{meta['render_backend']}_"
-        f"{meta['num_gaussians'] // 1000}k"
-    )
-    result_root = run_dir / f"custom_test_step{effective_step}_{render_tag}"
+    result_root = run_dir / f"custom_test_step{effective_step}_native_3dgut"
     output_dir = result_root / "renders"
     metrics_dir = result_root / f"_metrics_lpips_{LPIPS_NET}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1509,24 +1361,16 @@ def main() -> None:
     print(f"Test CSV            : {TEST_CSV_PATH}")
     print(f"Ground Truth        : {GT_DIR}")
     print(f"Test poses          : {len(records)}")
-    print(f"Checkpoint Gaussians: {meta['checkpoint_num_gaussians']:,}")
-    print(f"Rendered Gaussians  : {meta['num_gaussians']:,}")
-    print(f"Gaussian limited    : {meta['gaussians_limited']}")
-    print(f"Original backend    : {meta['original_backend']}")
-    print(f"Effective backend   : {meta['render_backend']}")
-    print(f"Backend reason      : {meta['backend_reason']}")
-    print(f"NHT decoder         : {meta['decoder_state']}")
+    print(f"Renderer             : native 3DGUT")
+    print(f"Gaussians            : {meta['num_gaussians']:,}")
+    print(f"Gaussian device      : {model.positions.device}")
+    print(f"NHT decoder          : {meta['decoder_state']}")
     print(f"Post processing     : {meta['post_processing']}")
     print(f"COLMAP camera model : {distortion['model']}")
     print(f"Radial coefficients : {np.asarray(distortion['radial']).tolist()}")
     print(f"Physical GPU        : {os.environ.get('PHYSICAL_GPU_ID', 'unknown')}")
     print(f"PyTorch device      : {device}")
     print(f"Checkpoint request  : {_checkpoint_step_raw}")
-    print(f"Requested backend   : {RENDER_BACKEND}")
-    print(f"Auto GRT threshold  : {AUTO_3DGRT_THRESHOLD:,}")
-    print(f"Safe 3DGUT renderer : {SAFE_3DGUT_RENDER}")
-    print(f"Effective culling   : {meta['effective_culling']}")
-    print(f"Extension cache     : {os.environ.get('TORCH_EXTENSIONS_DIR', 'default')}")
     print(f"Evaluation enabled  : {ENABLE_EVALUATION}")
     print(f"LPIPS network       : {LPIPS_NET if ENABLE_EVALUATION else 'disabled'}")
     print(f"Output              : {output_dir}")
@@ -1534,12 +1378,21 @@ def main() -> None:
     camera_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, dict[str, Any], torch.Tensor]] = {}
     rows: list[dict[str, Any]] = []
 
-    # Validate the first custom camera before entering the native CUDA renderer.
-    first_batch = make_batch(records[0], distortion, camera_cache, device)
-    validate_first_batch(records[0], first_batch, device)
-    torch.cuda.empty_cache()
-
     # CUDA/plugin warmup on the first pose.
+    first_batch = make_batch(records[0], distortion, camera_cache, device)
+    if not model.positions.is_cuda:
+        fail(
+            f"Gaussian positions unexpectedly moved to {model.positions.device} "
+            "before warmup."
+        )
+    if not first_batch.rays_dir.is_cuda:
+        fail(
+            f"Camera rays unexpectedly on {first_batch.rays_dir.device}."
+        )
+    print("[Warmup] Gaussian device :", model.positions.device)
+    print("[Warmup] Rays device     :", first_batch.rays_dir.device)
+    cuda_memory_line(device, "before warmup")
+
     with torch.inference_mode():
         for _ in range(2):
             warm = model(first_batch, train=False, frame_id=effective_step)
@@ -1556,10 +1409,7 @@ def main() -> None:
                 warm = apply_post_processing(post_processing, warm, first_batch, training=False)
         torch.cuda.synchronize(device)
 
-    for record in tqdm(
-        records,
-        desc=f"Rendering {meta['render_backend'].upper()} test poses",
-    ):
+    for record in tqdm(records, desc="Rendering native 3DGUT test poses"):
         output_path = output_path_for(output_dir, record["image_name"])
         row: dict[str, Any] = {
             "image_name": record["image_name"],
@@ -1661,19 +1511,6 @@ __RENDER_3DGRUT_V2_PY__
     echo "[Code] Embedded renderer created: $RENDER_LAUNCHER"
 }
 
-enforce_gpu_lock() {
-    if [[ "${GPU_ID:-1}" != "1" ]]; then
-        die "GPU_ID override is not allowed. This renderer is hard-locked to physical GPU 1."
-    fi
-
-    export CUDA_DEVICE_ORDER=PCI_BUS_ID
-    export CUDA_VISIBLE_DEVICES=1
-    export PHYSICAL_GPU_ID=1
-
-    echo "[GPU] Lock active: physical GPU 1 -> PyTorch logical cuda:0"
-}
-
-
 run_renderer() {
     export SCENE_NAME
     export APPEARANCE_MODE
@@ -1688,10 +1525,6 @@ run_renderer() {
     export ENABLE_EVALUATION
     export USE_NATIVE_DISTORTION
     export USE_FEATURE_DECODER_EMA
-    export RENDER_BACKEND
-    export AUTO_3DGRT_THRESHOLD
-    export SAFE_3DGUT_RENDER
-    export MAX_RENDER_GAUSSIANS
     export OVERWRITE_RENDER
     export SAVE_ALPHA
     export MAX_IMAGES
@@ -1710,17 +1543,14 @@ run_renderer() {
     echo "Checkpoint request   : $CHECKPOINT_STEP"
     echo "Checkpoint path      : ${CHECKPOINT_PATH:-auto}"
     echo "Physical GPU         : 1 (hard-locked)"
-    echo "PyTorch device       : cuda:0"
+    echo "PyTorch device       : cuda:0 (physical GPU 1)"
     echo "Venv                  : $VENV_DIR"
     echo "Slang compiler        : $SLANGC_BIN"
     echo "Native distortion    : $USE_NATIVE_DISTORTION"
     echo "NHT EMA              : $USE_FEATURE_DECODER_EMA"
-    echo "Render backend       : $RENDER_BACKEND"
-    echo "Auto GRT threshold   : $AUTO_3DGRT_THRESHOLD"
-    echo "Max render Gaussians : $MAX_RENDER_GAUSSIANS"
-    echo "Safe 3DGUT renderer  : $SAFE_3DGUT_RENDER"
+    echo "Renderer             : native 3DGUT from checkpoint config"
     echo "Torch extension dir  : $TORCH_EXTENSIONS_DIR"
-    echo "Ninja workers        : $MAX_JOBS"
+    echo "CUDA debug sync      : $CUDA_DEBUG_SYNC"
     echo "Evaluation           : $ENABLE_EVALUATION"
     echo "LPIPS                : $LPIPS_NET"
     echo "Overwrite renders    : $OVERWRITE_RENDER"
@@ -1734,6 +1564,7 @@ run_renderer() {
         CUDA_DEVICE_ORDER=PCI_BUS_ID \
         CUDA_VISIBLE_DEVICES=1 \
         PHYSICAL_GPU_ID=1 \
+        TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR" \
         "$VENV_DIR/bin/python" "$RENDER_LAUNCHER"
 }
 
@@ -1753,7 +1584,6 @@ echo "Physical GPU     : 1 (hard-locked)"
 echo "Slang compiler   : $SLANGC_BIN"
 echo "============================================================"
 
-enforce_gpu_lock
 check_runtime
 ensure_slangc
 prepare_dataset_view
@@ -1766,6 +1596,5 @@ echo "============================================================"
 echo "RENDER FINISHED"
 echo "============================================================"
 echo "Run      : $OUT_ROOT/$RUN_NAME"
-echo "Backend  : $RENDER_BACKEND (effective backend is printed above)"
 echo "Log      : $LOG_FILE"
 echo "============================================================"
