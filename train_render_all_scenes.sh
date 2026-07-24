@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# VERSION: PTY_FIX_V2_2026-07-24
-# Fix: preserve Rich training progress through util-linux script pseudo-TTY.
+# VERSION: NATIVE_PROGRESS_QUIET_MCMC_V4_2026-07-24
+# Fix 1: let each child train/render script manage its own PTY exactly as when run directly.
+# Fix 2: generate a quiet copy of the train script with strategy.print_stats=false.
 #
 # Train + render tuần tự toàn bộ scene của VAI_NVS_DATA_ROUND_2.
 #
@@ -99,6 +100,17 @@ OVERWRITE_EXPERIMENT="${OVERWRITE_EXPERIMENT:-false}"
 INSTALL_SYSTEM_PACKAGES="${INSTALL_SYSTEM_PACKAGES:-0}"
 FORCE_ENV_SETUP="${FORCE_ENV_SETUP:-0}"
 
+# false: ẩn riêng các dòng:
+#   [INFO] Relocated ... gaussians
+#   [INFO] Added ... gaussians
+# MCMC vẫn relocate/add bình thường; chỉ tắt phần logger thống kê.
+MCMC_PRINT_STATS="${MCMC_PRINT_STATS:-false}"
+
+# Script train thực tế sẽ được gán trong preflight.
+# Khi MCMC_PRINT_STATS=false, wrapper tạo một bản copy cạnh file train gốc
+# và chèn Hydra override strategy.print_stats=false vào embedded launcher.
+ACTIVE_TRAIN_SCRIPT="$TRAIN_SCRIPT"
+
 # =============================================================================
 # CẤU HÌNH RENDER TEST POSE
 # =============================================================================
@@ -119,13 +131,10 @@ SKIP_COMPLETED_TRAIN="${SKIP_COMPLETED_TRAIN:-true}"
 SKIP_COMPLETED_RENDER="${SKIP_COMPLETED_RENDER:-true}"
 STOP_ON_ERROR="${STOP_ON_ERROR:-true}"
 
-# Script train dùng Rich progress bar, vì vậy stdout phải là một TTY thật.
-# Wrapper sẽ tự chạy lại bên trong util-linux `script` để vừa giữ progress
-# trực tiếp trên terminal, vừa ghi toàn bộ phiên làm việc vào BATCH_LOG.
-BATCH_USE_PTY_LOGGING="${BATCH_USE_PTY_LOGGING:-true}"
-
-# Không cần tạo PTY lồng thêm trong từng script con vì wrapper đã cung cấp TTY.
-CHILD_USE_PTY_LOGGING="${CHILD_USE_PTY_LOGGING:-false}"
+# Không bọc toàn bộ batch bằng tee/script.
+# Mỗi script con tự tạo PTY và ghi log giống hệt khi bạn chạy file train riêng.
+# Đây là điều kiện để Rich hiển thị đúng thanh progress động.
+CHILD_USE_PTY_LOGGING="${CHILD_USE_PTY_LOGGING:-true}"
 
 # =============================================================================
 # LOGGING
@@ -133,27 +142,15 @@ CHILD_USE_PTY_LOGGING="${CHILD_USE_PTY_LOGGING:-false}"
 
 mkdir -p "$OUT_ROOT" "$LOG_ROOT"
 TIMESTAMP="${BATCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-BATCH_LOG="$LOG_ROOT/train_render_all_${TIMESTAMP}.log"
 SUMMARY_FILE="$LOG_ROOT/train_render_all_${TIMESTAMP}.tsv"
 CURRENT_SCENE="not-started"
 
-# Preserve Rich/tqdm live progress while still recording a complete terminal log.
-# `script` allocates a pseudo-terminal, unlike `tee`, which converts stdout to
-# a pipe and causes Rich to disable its live progress display.
-if [[ "$BATCH_USE_PTY_LOGGING" == "true" \
-   && -z "${_3DGRUT_BATCH_PTY_ACTIVE:-}" \
-   && -t 1 \
-   && -x "$(command -v script 2>/dev/null || true)" ]]; then
-    export _3DGRUT_BATCH_PTY_ACTIVE=1
-    export BATCH_TIMESTAMP="$TIMESTAMP"
-    printf -v _BATCH_REEXEC_COMMAND '%q ' bash "$0" "$@"
-    exec script -q -f -e -c "$_BATCH_REEXEC_COMMAND" "$BATCH_LOG"
-fi
-
-# Non-interactive fallback for nohup/CI/redirection. Logs are still written,
-# but a dynamically updating progress bar cannot be displayed without a TTY.
-if [[ -z "${_3DGRUT_BATCH_PTY_ACTIVE:-}" ]]; then
-    exec > >(tee -a "$BATCH_LOG") 2>&1
+# Không redirect stdout/stderr ở wrapper. Script train con phải nhìn thấy
+# terminal thật để tự chạy lại qua util-linux `script` và giữ Rich progress.
+if [[ ! -t 1 ]]; then
+    echo "WARNING: stdout hiện không phải TTY." >&2
+    echo "WARNING: Hãy chạy trực tiếp: bash $0 [scene ...]" >&2
+    echo "WARNING: Không dùng '| tee', 'nohup' hoặc '> logfile' nếu cần progress động." >&2
 fi
 
 printf 'scene\ttrain_status\trender_status\tcheckpoint\trender_dir\n' > "$SUMMARY_FILE"
@@ -165,7 +162,6 @@ on_error() {
     echo "BATCH FAILED" >&2
     echo "Scene     : $CURRENT_SCENE" >&2
     echo "Exit code : $exit_code" >&2
-    echo "Log       : $BATCH_LOG" >&2
     echo "Summary   : $SUMMARY_FILE" >&2
     echo "============================================================" >&2
     exit "$exit_code"
@@ -342,6 +338,93 @@ append_summary() {
         >> "$SUMMARY_FILE"
 }
 
+prepare_train_script() {
+    ACTIVE_TRAIN_SCRIPT="$TRAIN_SCRIPT"
+
+    # Khi bật thống kê, dùng nguyên file train gốc.
+    if is_true "$MCMC_PRINT_STATS"; then
+        echo "[Train config] MCMC print_stats=true; giữ log Relocated/Added."
+        return 0
+    fi
+
+    local train_dir=""
+    local train_base=""
+    local quiet_script=""
+    local py=""
+
+    train_dir="$(cd -- "$(dirname -- "$TRAIN_SCRIPT")" >/dev/null 2>&1 && pwd)"
+    train_base="$(basename -- "$TRAIN_SCRIPT")"
+    quiet_script="$train_dir/${train_base%.sh}_quiet_mcmc_generated.sh"
+
+    if command -v python3 >/dev/null 2>&1; then
+        py="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        py="$(command -v python)"
+    else
+        die "Không tìm thấy Python để tạo quiet train script."
+    fi
+
+    "$py" - "$TRAIN_SCRIPT" "$quiet_script" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).resolve()
+target = Path(sys.argv[2]).resolve()
+
+text = source.read_text(encoding="utf-8")
+
+# Nếu file đã có override, ép giá trị về false.
+existing = re.compile(
+    r'^(?P<indent>\s*)"strategy\.print_stats=(?:true|false)",\s*$',
+    flags=re.MULTILINE,
+)
+
+if existing.search(text):
+    text = existing.sub(
+        lambda match: f'{match.group("indent")}"strategy.print_stats=false",',
+        text,
+        count=1,
+    )
+else:
+    anchor = '        f"strategy.add.max_n_gaussians={CAP_MAX}",\n'
+    override = '        "strategy.print_stats=false",\n'
+
+    if anchor not in text:
+        raise SystemExit(
+            "Không tìm thấy anchor strategy.add.max_n_gaussians trong train script. "
+            "Không thể chèn strategy.print_stats=false an toàn."
+        )
+
+    text = text.replace(anchor, anchor + override, 1)
+
+version_marker = "# GENERATED QUIET MCMC COPY: strategy.print_stats=false\n"
+if version_marker not in text:
+    if text.startswith("#!/usr/bin/env bash\n"):
+        text = text.replace(
+            "#!/usr/bin/env bash\n",
+            "#!/usr/bin/env bash\n" + version_marker,
+            1,
+        )
+    else:
+        text = version_marker + text
+
+target.write_text(text, encoding="utf-8")
+target.chmod(source.stat().st_mode)
+print(target)
+PY
+
+    [[ -f "$quiet_script" ]] || die \
+        "Không tạo được quiet train script: $quiet_script"
+
+    chmod +x "$quiet_script"
+    ACTIVE_TRAIN_SCRIPT="$quiet_script"
+
+    echo "[Train config] Đã tắt MCMC stats:"
+    echo "[Train config]   strategy.print_stats=false"
+    echo "[Train config] Quiet script: $ACTIVE_TRAIN_SCRIPT"
+}
+
 preflight() {
     [[ -f "$TRAIN_SCRIPT" ]] || die \
         "Không tìm thấy train script: $TRAIN_SCRIPT"
@@ -349,6 +432,12 @@ preflight() {
         "Không tìm thấy render script: $RENDER_SCRIPT"
     [[ -d "$DATASET_ROOT" ]] || die \
         "Không tìm thấy dataset root: $DATASET_ROOT"
+    command -v script >/dev/null 2>&1 || die \
+        "Thiếu lệnh 'script' của util-linux; file train cần lệnh này để giữ Rich progress."
+    [[ -t 1 ]] || die \
+        "stdout không phải TTY. Chạy trực tiếp trong terminal, không dùng tee/nohup/redirect."
+
+    prepare_train_script
 
     local scene=""
     local scene_root=""
@@ -403,8 +492,8 @@ run_training() {
         OVERWRITE_EXPERIMENT="$OVERWRITE_EXPERIMENT" \
         INSTALL_SYSTEM_PACKAGES="$INSTALL_SYSTEM_PACKAGES" \
         FORCE_ENV_SETUP="$FORCE_ENV_SETUP" \
-        USE_PTY_LOGGING="$CHILD_USE_PTY_LOGGING" \
-        bash "$TRAIN_SCRIPT" "$scene"
+        USE_PTY_LOGGING="true" \
+        bash "$ACTIVE_TRAIN_SCRIPT" "$scene"
 }
 
 run_rendering() {
@@ -433,7 +522,7 @@ run_rendering() {
         OVERWRITE_RENDER="$OVERWRITE_RENDER" \
         SAVE_ALPHA="$SAVE_ALPHA" \
         MAX_IMAGES="$MAX_IMAGES" \
-        USE_PTY_LOGGING="$CHILD_USE_PTY_LOGGING" \
+        USE_PTY_LOGGING="true" \
         bash "$RENDER_SCRIPT" "$scene"
 }
 
@@ -446,7 +535,8 @@ preflight
 section "VAI NVS ROUND 2 — TRAIN + RENDER TUẦN TỰ"
 echo "Thời gian        : $(date --iso-8601=seconds)"
 echo "Dataset          : $DATASET_ROOT"
-echo "Train script     : $TRAIN_SCRIPT"
+echo "Train script gốc : $TRAIN_SCRIPT"
+echo "Train script dùng: $ACTIVE_TRAIN_SCRIPT"
 echo "Render script    : $RENDER_SCRIPT"
 echo "Repository       : $REPO_DIR"
 echo "Run root         : $OUT_ROOT"
@@ -454,12 +544,13 @@ echo "GPU vật lý       : $GPU_ID"
 echo "Preset           : $TRAIN_PRESET"
 echo "Appearance       : $APPEARANCE_MODE"
 echo "Gaussian cap     : $CAP_MAX"
+echo "MCMC print stats : $MCMC_PRINT_STATS"
 echo "NHT feature dim  : $NHT_FEATURE_DIM"
 echo "NHT decoder      : ${NHT_DECODER_HIDDEN_DIM} x ${NHT_DECODER_NUM_LAYERS}"
 echo "Steps            : $MAX_STEPS"
 echo "Eval test        : $ENABLE_EVALUATION"
 echo "Auto resume      : $AUTO_RESUME"
-echo "Batch log        : $BATCH_LOG"
+echo "Child PTY        : $CHILD_USE_PTY_LOGGING"
 echo "Summary          : $SUMMARY_FILE"
 echo "Scenes:"
 printf '  - %s\n' "${SCENE_LIST[@]}"
@@ -580,7 +671,7 @@ section "BATCH HOÀN THÀNH"
 echo "Scene hoàn thành : $completed_scenes / ${#SCENE_LIST[@]}"
 echo "Stage thất bại   : $failed_stages"
 echo "Run root         : $OUT_ROOT"
-echo "Batch log        : $BATCH_LOG"
+echo "Child PTY        : $CHILD_USE_PTY_LOGGING"
 echo "Summary          : $SUMMARY_FILE"
 
 if (( failed_stages > 0 )); then
