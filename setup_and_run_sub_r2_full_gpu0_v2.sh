@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ONE-FILE ROUND-2 SETUP + FULL PIPELINE
+# ONE-FILE GSPLAT INSTALL + ROUND-2 SETUP + FULL PIPELINE
 #
 # Pipeline source:
 #   Embedded run_sub_r2.sh
@@ -24,7 +24,9 @@
 #   └── test/test_poses.csv
 #
 # Full sequence:
-#   setup → workspace links → train each seed → selfcheck first seed
+#   system prerequisites → clone gsplat → create venv → install PyTorch
+#   → build/install gsplat CUDA extension + example dependencies
+#   → workspace links → train each seed → selfcheck first seed
 #   → render each seed → mean ensemble → enhancer train/apply
 #
 # Packaging is disabled by default:
@@ -35,6 +37,8 @@
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
+
+SCRIPT_VERSION="2026-07-24-v2-gsplat-bootstrap"
 
 on_error() {
     local exit_code=$?
@@ -66,6 +70,34 @@ DATASET_ROOT="${DATASET_ROOT:-$PUBLIC_SET_ROOT}"
 
 GPU_ID="${GPU_ID:-0}"
 
+# gsplat source setup. The official repository is used by default.
+GSPLAT_DIR="${GSPLAT_DIR:-$PROJECT_DIR/gsplat}"
+GSPLAT_REPO_URL="${GSPLAT_REPO_URL:-https://github.com/nerfstudio-project/gsplat.git}"
+GSPLAT_REF="${GSPLAT_REF:-main}"
+
+# Existing repositories are reused by default. Set GSPLAT_UPDATE=1 to fetch and
+# checkout GSPLAT_REF. Set GSPLAT_FORCE_RESET=1 only when local modifications
+# may be discarded.
+GSPLAT_UPDATE="${GSPLAT_UPDATE:-0}"
+GSPLAT_FORCE_RESET="${GSPLAT_FORCE_RESET:-0}"
+
+# auto: install only when imports/markers are missing
+# 1   : always run gsplat/example dependency installation
+# 0   : never install Python packages
+INSTALL_GSPLAT="${INSTALL_GSPLAT:-auto}"
+
+# PyTorch must exist before gsplat is built. When torch is absent, these package
+# specs are installed. Override TORCH_INDEX_URL for a particular CUDA wheel
+# channel, for example:
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+TORCH_PACKAGES="${TORCH_PACKAGES:-torch==2.9.1 torchvision==0.24.1}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+
+MAX_JOBS="${MAX_JOBS:-8}"
+FORCE_GSPLAT_REBUILD="${FORCE_GSPLAT_REBUILD:-0}"
+PATCH_GSPLAT_RUN_SUB_COMPAT="${PATCH_GSPLAT_RUN_SUB_COMPAT:-1}"
+GSPLAT_BUILD_MARKER="${GSPLAT_BUILD_MARKER:-}"
+
 # Preserve explicit empty values for two-machine splitting.
 SCENES_HCM="${SCENES_HCM-"HCM0421 HCM0539 HCM0540 HCM0644 HCM0674"}"
 SCENES_OBJ="${SCENES_OBJ-"bonsai chair"}"
@@ -93,6 +125,7 @@ STRICT_GPU_MEMORY_CHECK="${STRICT_GPU_MEMORY_CHECK:-0}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PY="$VENV_DIR/bin/python"
+GSPLAT_BUILD_MARKER="${GSPLAT_BUILD_MARKER:-$VENV_DIR/.gsplat_source_installed}"
 
 WORKSPACE_R2_ROOT="${WORKSPACE_R2_ROOT:-$PROJECT_DIR/workspace_r2}"
 TOOLS_DIR="$PROJECT_DIR/tools"
@@ -224,103 +257,445 @@ install_system_packages() {
         libglib2.0-0
 }
 
-setup_python_environment() {
-    if [[ ! -x "$PY" ]]; then
-        echo "[Python] Creating venv: $VENV_DIR"
-        "$PYTHON_BIN" -m venv "$VENV_DIR"
-        FORCE_PIP_SETUP=1
+setup_cuda_toolkit() {
+    local nvcc_path=""
+    local nvcc_real=""
+
+    if [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]]; then
+        CUDA_HOME="$(readlink -f "$CUDA_HOME")"
+    elif have_command nvcc; then
+        nvcc_path="$(command -v nvcc)"
+        nvcc_real="$(readlink -f "$nvcc_path")"
+        CUDA_HOME="$(dirname "$(dirname "$nvcc_real")")"
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+        CUDA_HOME="$(readlink -f /usr/local/cuda)"
     else
-        echo "[Python] Reusing venv: $VENV_DIR"
+        local candidate=""
+        for candidate in /usr/local/cuda-*; do
+            if [[ -x "$candidate/bin/nvcc" ]]; then
+                CUDA_HOME="$candidate"
+            fi
+        done
     fi
 
-    local should_setup=0
+    [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] || die \
+        "CUDA toolkit/nvcc was not found. Install a CUDA toolkit compatible " \
+        "with the selected PyTorch build or set CUDA_HOME."
 
-    case "$SETUP_PYTHON_ENV" in
-        1|true|yes|on)
-            should_setup=1
-            ;;
-        0|false|no|off)
-            should_setup=0
-            ;;
-        auto)
-            if [[ "$FORCE_PIP_SETUP" == "1" ]]; then
-                should_setup=1
-            elif ! (
-                cd "$PROJECT_DIR"
-                "$PY" -c \
-                    "import torch, numpy, cv2, gsplat; from pycolmap import SceneManager"
-            ) >/dev/null 2>&1
-            then
-                should_setup=1
-            fi
-            ;;
-        *)
-            die "SETUP_PYTHON_ENV must be auto, true, or false."
-            ;;
-    esac
+    export CUDA_HOME
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+    export MAX_JOBS
 
-    if (( should_setup == 1 )); then
-        "$PY" -m pip install --upgrade pip setuptools wheel ninja
+    echo "[CUDA] CUDA_HOME=$CUDA_HOME"
+    echo "[CUDA] nvcc=$(readlink -f "$CUDA_HOME/bin/nvcc")"
+    "$CUDA_HOME/bin/nvcc" --version
+}
 
-        if [[ -f "$PROJECT_DIR/requirements.txt" ]]; then
-            echo "[Python] Installing requirements.txt"
-            "$PY" -m pip install -r "$PROJECT_DIR/requirements.txt"
-        fi
+clone_or_prepare_gsplat() {
+    mkdir -p "$(dirname "$GSPLAT_DIR")"
 
-        case "$INSTALL_PROJECT_EDITABLE" in
-            1|true|yes|on)
-                "$PY" -m pip install -e "$PROJECT_DIR"
-                ;;
-            auto)
-                if [[ -f "$PROJECT_DIR/pyproject.toml" \
-                   || -f "$PROJECT_DIR/setup.py" ]]
-                then
-                    echo "[Python] Installing project in editable mode."
-                    "$PY" -m pip install -e "$PROJECT_DIR"
-                fi
-                ;;
-            0|false|no|off)
-                ;;
-            *)
-                die "INSTALL_PROJECT_EDITABLE must be auto, true, or false."
-                ;;
-        esac
+    if [[ ! -d "$GSPLAT_DIR/.git" ]]; then
+        [[ ! -e "$GSPLAT_DIR" ]] || die \
+            "GSPLAT_DIR exists but is not a Git repository: $GSPLAT_DIR"
 
-        if [[ -n "$EXTRA_PIP_REQUIREMENTS" ]]; then
-            # Intentional splitting: this variable contains pip package specs.
-            # shellcheck disable=SC2086
-            "$PY" -m pip install $EXTRA_PIP_REQUIREMENTS
-        fi
+        echo "[Git] Cloning gsplat..."
+        echo "[Git] Repository : $GSPLAT_REPO_URL"
+        echo "[Git] Destination: $GSPLAT_DIR"
+
+        git clone --recursive "$GSPLAT_REPO_URL" "$GSPLAT_DIR"
+        GSPLAT_UPDATE=1
+    else
+        echo "[Git] Reusing existing gsplat source: $GSPLAT_DIR"
     fi
 
     (
-        cd "$PROJECT_DIR"
-        "$PY" - <<'PY_VERIFY'
-import cv2
-import gsplat
-import numpy
-import torch
-from pycolmap import SceneManager
+        cd "$GSPLAT_DIR"
+        git remote set-url origin "$GSPLAT_REPO_URL"
 
-print("[Python] Python:", __import__("sys").version.split()[0])
-print("[Python] torch:", torch.__version__)
-print("[Python] torch CUDA:", torch.version.cuda)
-print("[Python] CUDA available:", torch.cuda.is_available())
-print("[Python] gsplat import: OK")
-print("[Python] pycolmap.SceneManager import: OK")
-print("[Python] cv2:", cv2.__version__)
+        if [[ "$GSPLAT_UPDATE" == "1" ]]; then
+            echo "[Git] Fetching gsplat ref: $GSPLAT_REF"
+            git fetch --tags --force origin
+
+            if [[ "$GSPLAT_FORCE_RESET" == "1" ]]; then
+                git reset --hard
+                git clean -fd
+            elif [[ -n "$(git status --porcelain)" ]]; then
+                die \
+                    "gsplat has local changes. Commit/stash them, or set " \
+                    "GSPLAT_FORCE_RESET=1 to discard them."
+            fi
+
+            if git rev-parse --verify --quiet "$GSPLAT_REF^{commit}" >/dev/null; then
+                git checkout --detach "$GSPLAT_REF"
+            elif git rev-parse --verify --quiet "origin/$GSPLAT_REF^{commit}" >/dev/null; then
+                git checkout --detach "origin/$GSPLAT_REF"
+            else
+                # Supports explicit commit hashes that are not local yet.
+                git fetch --force origin "$GSPLAT_REF"
+                git checkout --detach FETCH_HEAD
+            fi
+        fi
+
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+        echo "[Git] gsplat revision: $(git rev-parse HEAD)"
+        echo "[Git] gsplat status:"
+        git status --short
+    )
+
+    [[ -f "$GSPLAT_DIR/examples/simple_trainer.py" ]] || die \
+        "Cloned gsplat source does not contain examples/simple_trainer.py"
+    [[ -f "$GSPLAT_DIR/examples/requirements.txt" ]] || die \
+        "Cloned gsplat source does not contain examples/requirements.txt"
+}
+
+patch_gsplat_run_sub_compat() {
+    [[ "$PATCH_GSPLAT_RUN_SUB_COMPAT" == "1" ]] || {
+        echo "[Patch] Skipping run_sub_r2 compatibility patch."
+        return
+    }
+
+    "$PYTHON_BIN" - "$GSPLAT_DIR/examples/simple_trainer.py" <<'PY_PATCH_GSPLAT'
+from pathlib import Path
+import py_compile
+import shutil
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+marker = "# BEGIN RUN_SUB_R2 COMPAT PATCH"
+
+if marker in text:
+    print(f"[Patch] run_sub_r2 compatibility already present: {path}")
+    raise SystemExit(0)
+
+backup = path.with_name(path.name + ".pre_run_sub_r2_compat.bak")
+if not backup.exists():
+    shutil.copy2(path, backup)
+
+
+def replace_once(old: str, new: str, label: str) -> None:
+    global text
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"{label}: expected one source anchor, found {count}. "
+            "Set GSPLAT_REF to a compatible revision or disable "
+            "PATCH_GSPLAT_RUN_SUB_COMPAT."
+        )
+    text = text.replace(old, new, 1)
+
+
+# Tyro exposes dataclass fields as CLI flags with underscores converted to
+# hyphens. These fields provide --global-seed, --raw-distortion,
+# --dist-k1-override and --dist-k2-override.
+config_anchor = """    # A global scaler that applies to the scene size related parameters
+    global_scale: float = 1.0
+"""
+config_replacement = """    # BEGIN RUN_SUB_R2 COMPAT PATCH
+    # Reproducible seed used by tools/run_sub_r2.sh.
+    global_seed: int = 42
+
+    # Compatibility flag for the production command. Current gsplat's COLMAP
+    # parser already keeps camera distortion and passes it to 3DGUT, so this
+    # flag intentionally does not undistort or alter the input images.
+    raw_distortion: bool = False
+
+    # Optional measured radial-distortion overrides used by USE_TRUE_DIST=1.
+    dist_k1_override: Optional[float] = None
+    dist_k2_override: Optional[float] = None
+    # END RUN_SUB_R2 COMPAT PATCH
+
+    # A global scaler that applies to the scene size related parameters
+    global_scale: float = 1.0
+"""
+replace_once(config_anchor, config_replacement, "Config compatibility fields")
+
+replace_once(
+    "        set_random_seed(42 + local_rank)\n",
+    "        set_random_seed(cfg.global_seed + local_rank)\n",
+    "configurable global seed",
+)
+
+parser_anchor = """            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                load_exposure=cfg.load_exposure,
+            )
+            self.trainset = Dataset(
+"""
+parser_replacement = """            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                load_exposure=cfg.load_exposure,
+            )
+
+            # BEGIN RUN_SUB_R2 DISTORTION OVERRIDE PATCH
+            if (
+                cfg.dist_k1_override is not None
+                or cfg.dist_k2_override is not None
+            ):
+                import numpy as _np
+
+                for _camera_id, _params in self.parser.params_dict.items():
+                    _updated = _np.zeros(4, dtype=_np.float32)
+                    _params_array = _np.asarray(_params, dtype=_np.float32)
+                    _updated[: min(len(_params_array), 4)] = _params_array[:4]
+
+                    if cfg.dist_k1_override is not None:
+                        _updated[0] = float(cfg.dist_k1_override)
+                    if cfg.dist_k2_override is not None:
+                        _updated[1] = float(cfg.dist_k2_override)
+
+                    self.parser.params_dict[_camera_id] = _updated
+
+                print(
+                    "[Parser] radial distortion override: "
+                    f"k1={cfg.dist_k1_override}, "
+                    f"k2={cfg.dist_k2_override}"
+                )
+            # END RUN_SUB_R2 DISTORTION OVERRIDE PATCH
+
+            self.trainset = Dataset(
+"""
+replace_once(parser_anchor, parser_replacement, "distortion override")
+
+path.write_text(text, encoding="utf-8")
+py_compile.compile(str(path), doraise=True)
+print(f"[Patch] Added run_sub_r2 compatibility: {path}")
+print(f"[Patch] Backup: {backup}")
+PY_PATCH_GSPLAT
+}
+
+install_torch_if_missing() {
+    if "$PY" -c "import torch, torchvision" >/dev/null 2>&1; then
+        echo "[Python] Existing PyTorch installation detected."
+        return
+    fi
+
+    local -a torch_packages=()
+    read -r -a torch_packages <<< "$TORCH_PACKAGES"
+    (( ${#torch_packages[@]} > 0 )) || die "TORCH_PACKAGES is empty."
+
+    echo "[Python] Installing PyTorch before building gsplat:"
+    printf '  %q' "${torch_packages[@]}"
+    echo
+
+    if [[ -n "$TORCH_INDEX_URL" ]]; then
+        "$PY" -m pip install \
+            --index-url "$TORCH_INDEX_URL" \
+            "${torch_packages[@]}"
+    else
+        "$PY" -m pip install "${torch_packages[@]}"
+    fi
+}
+
+install_gsplat_source() {
+    local should_install=0
+    local current_revision=""
+    local marker_revision=""
+
+    current_revision="$(git -C "$GSPLAT_DIR" rev-parse HEAD)"
+
+    case "$INSTALL_GSPLAT" in
+        1|true|yes|on)
+            should_install=1
+            ;;
+        0|false|no|off)
+            should_install=0
+            ;;
+        auto)
+            if [[ "$FORCE_GSPLAT_REBUILD" == "1" ]]; then
+                should_install=1
+            elif [[ ! -f "$GSPLAT_BUILD_MARKER" ]]; then
+                should_install=1
+            else
+                marker_revision="$(cat "$GSPLAT_BUILD_MARKER" 2>/dev/null || true)"
+                if [[ "$marker_revision" != "$current_revision" ]]; then
+                    should_install=1
+                elif ! (
+                    cd "$PROJECT_DIR"
+                    "$PY" -c \
+                        "import torch, torchvision, gsplat, cv2, pycolmap; assert hasattr(pycolmap, 'Reconstruction') or hasattr(pycolmap, 'SceneManager')"
+                ) >/dev/null 2>&1
+                then
+                    should_install=1
+                fi
+            fi
+            ;;
+        *)
+            die "INSTALL_GSPLAT must be auto, true, or false."
+            ;;
+    esac
+
+    if (( should_install == 0 )); then
+        echo "[Python] gsplat source environment is already ready."
+        return
+    fi
+
+    echo "[Python] Installing gsplat source and example dependencies..."
+    "$PY" -m pip install --upgrade pip setuptools wheel ninja packaging
+
+    install_torch_if_missing
+
+    # Build/install the CUDA extension from the cloned source.
+    (
+        cd "$GSPLAT_DIR"
+        MAX_JOBS="$MAX_JOBS" \
+        "$PY" -m pip install \
+            --no-build-isolation \
+            --config-settings editable_mode=compat \
+            -e .
+    )
+
+    # Install the exact dependencies required by simple_trainer.py, render and
+    # PPISP/bilateral-grid support. PyTorch is installed first intentionally.
+    "$PY" -m pip install \
+        --no-build-isolation \
+        -r "$GSPLAT_DIR/examples/requirements.txt"
+
+    # Reinstall editable source last in case dependency resolution changed it.
+    (
+        cd "$GSPLAT_DIR"
+        MAX_JOBS="$MAX_JOBS" \
+        "$PY" -m pip install \
+            --no-build-isolation \
+            --config-settings editable_mode=compat \
+            -e .
+    )
+
+    printf '%s\n' "$current_revision" > "$GSPLAT_BUILD_MARKER"
+    echo "[Python] gsplat install marker: $GSPLAT_BUILD_MARKER"
+}
+
+verify_gsplat_pipeline() {
+    (
+        cd "$PROJECT_DIR"
+        "$PY" - "$GSPLAT_DIR/examples/simple_trainer.py" <<'PY_VERIFY_GSPLAT'
+import importlib
+import subprocess
+import sys
+from pathlib import Path
+
+trainer = Path(sys.argv[1])
+required_modules = [
+    "torch",
+    "torchvision",
+    "gsplat",
+    "numpy",
+    "cv2",
+    "tyro",
+    "tensorboard",
+    "torchmetrics",
+]
+
+missing = []
+for name in required_modules:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {exc}")
+
+try:
+    import pycolmap
+    if not (
+        hasattr(pycolmap, "Reconstruction")
+        or hasattr(pycolmap, "SceneManager")
+    ):
+        raise AttributeError(
+            "neither Reconstruction nor SceneManager is available"
+        )
+except Exception as exc:
+    missing.append(f"pycolmap parser API: {exc}")
+
+if missing:
+    raise SystemExit(
+        "Missing or broken Python dependencies:\n  - " + "\n  - ".join(missing)
+    )
+
+import torch
+import gsplat
+
+print("[Verify] Python:", sys.version.split()[0])
+print("[Verify] torch:", torch.__version__)
+print("[Verify] torch CUDA:", torch.version.cuda)
+print("[Verify] gsplat:", getattr(gsplat, "__version__", "source/editable"))
+print("[Verify] CUDA available:", torch.cuda.is_available())
 
 if not torch.cuda.is_available():
     raise SystemExit("PyTorch cannot access CUDA.")
-
 if torch.cuda.device_count() != 1:
     raise SystemExit(
         f"Expected one visible CUDA GPU, got {torch.cuda.device_count()}."
     )
 
-print("[Python] logical cuda:0:", torch.cuda.get_device_name(0))
-PY_VERIFY
+print("[Verify] logical cuda:0:", torch.cuda.get_device_name(0))
+
+proc = subprocess.run(
+    [sys.executable, str(trainer), "mcmc", "--help"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    check=False,
+)
+help_text = proc.stdout
+
+if proc.returncode != 0:
+    raise SystemExit(
+        "simple_trainer.py mcmc --help failed:\n" + help_text[-4000:]
     )
+
+required_flags = [
+    "--with-ut",
+    "--with-eval3d",
+    "--raw-distortion",
+    "--strategy.cap-max",
+    "--global-seed",
+    "--save-steps",
+    "--eval-steps",
+]
+missing_flags = [flag for flag in required_flags if flag not in help_text]
+
+if missing_flags:
+    raise SystemExit(
+        "The selected gsplat revision does not expose the flags required by "
+        "run_sub_r2.sh: "
+        + ", ".join(missing_flags)
+        + "\nUse GSPLAT_REPO_URL/GSPLAT_REF to select the compatible fork or commit."
+    )
+
+print("[Verify] Required run_sub_r2 trainer flags: OK")
+PY_VERIFY_GSPLAT
+    )
+}
+
+setup_python_environment() {
+    if [[ ! -x "$PY" ]]; then
+        echo "[Python] Creating venv: $VENV_DIR"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
+    else
+        echo "[Python] Reusing venv: $VENV_DIR"
+    fi
+
+    "$PY" -m pip install --upgrade pip setuptools wheel ninja packaging
+
+    install_gsplat_source
+
+    if [[ -n "$EXTRA_PIP_REQUIREMENTS" ]]; then
+        local -a extra_packages=()
+        read -r -a extra_packages <<< "$EXTRA_PIP_REQUIREMENTS"
+        if (( ${#extra_packages[@]} > 0 )); then
+            "$PY" -m pip install "${extra_packages[@]}"
+        fi
+    fi
+
+    verify_gsplat_pipeline
 }
 
 find_scene_source() {
@@ -395,6 +770,29 @@ prepare_workspace_scene() {
 
     ln -s "$train_root" "$target"
     echo "[Data] Workspace: $target -> $(readlink -f "$target")"
+}
+
+prepare_project_gsplat_link() {
+    local expected="$PROJECT_DIR/gsplat"
+    local actual
+    actual="$(readlink -f "$GSPLAT_DIR")"
+
+    if [[ "$expected" == "$GSPLAT_DIR" ]]; then
+        return
+    fi
+
+    if [[ -L "$expected" ]]; then
+        rm -f "$expected"
+    elif [[ -e "$expected" ]]; then
+        local existing
+        existing="$(readlink -f "$expected")"
+        [[ "$existing" == "$actual" ]] || die \
+            "PROJECT_DIR/gsplat already exists and points elsewhere: $expected"
+        return
+    fi
+
+    ln -s "$actual" "$expected"
+    echo "[Data] gsplat link: $expected -> $actual"
 }
 
 prepare_r2_alias() {
@@ -488,7 +886,8 @@ dist_true_of(){ awk -v s="$1" '$1==s{print $2, $3}' tools/distortion_r2.tsv; }
 
 say "0. tiên quyết"
 [ -x "$PY" ] || die "thiếu .venv"
-$PY -c "from pycolmap import SceneManager" 2>/dev/null || die ".venv hỏng pycolmap rmbrualla (DOC3 §3.7) — chạy GATE_B.sh B2.0 hoặc pip install lại"
+$PY -c "import pycolmap; assert hasattr(pycolmap, 'Reconstruction') or hasattr(pycolmap, 'SceneManager')" 2>/dev/null \
+  || die ".venv hỏng pycolmap: cần Reconstruction hoặc SceneManager"
 for s in $SCENES_HCM $SCENES_OBJ; do
   [ -s "workspace_r2/$s/sparse/0/images.bin" ] || die "thiếu workspace_r2/$s → bash tools/prepare_r2.sh trước"
 done
@@ -677,8 +1076,6 @@ ALL_SCENES=("${OBJ_ARRAY[@]}" "${HCM_ARRAY[@]}")
 (( ${#ALL_SCENES[@]} > 0 )) || die "No scenes selected."
 
 [[ -d "$DATASET_ROOT" ]] || die "Dataset root does not exist: $DATASET_ROOT"
-[[ -f "$PROJECT_DIR/gsplat/examples/simple_trainer.py" ]] || die \
-    "Missing trainer: $PROJECT_DIR/gsplat/examples/simple_trainer.py"
 
 for required_tool in \
     "$PROJECT_DIR/tools/render_test_poses.py" \
@@ -690,9 +1087,17 @@ do
 done
 
 say "ROUND-2 SETUP"
+echo "Script version        : $SCRIPT_VERSION"
 echo "Project directory     : $PROJECT_DIR"
 echo "AI Tuyen root         : $AI_TUYEN_ROOT"
 echo "Dataset root          : $DATASET_ROOT"
+echo "gsplat repository     : $GSPLAT_REPO_URL"
+echo "gsplat ref            : $GSPLAT_REF"
+echo "gsplat directory      : $GSPLAT_DIR"
+echo "Install gsplat        : $INSTALL_GSPLAT"
+echo "Patch run_sub compat  : $PATCH_GSPLAT_RUN_SUB_COMPAT"
+echo "Torch packages        : $TORCH_PACKAGES"
+echo "Torch index URL       : ${TORCH_INDEX_URL:-default PyPI}"
 echo "Workspace root        : $WORKSPACE_R2_ROOT"
 echo "GPU                    : $GPU_ID"
 echo "HCM scenes             : $SCENES_HCM"
@@ -711,9 +1116,14 @@ export PHYSICAL_GPU_ID="$GPU_ID"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONUNBUFFERED=1
 
+echo "[Setup order] GPU → disk → packages → CUDA → clone gsplat → build/install → pipeline"
 check_gpu
 disk_guard
 install_system_packages
+setup_cuda_toolkit
+clone_or_prepare_gsplat
+prepare_project_gsplat_link
+patch_gsplat_run_sub_compat
 setup_python_environment
 prepare_r2_alias
 
