@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# VERSION: PTY_FIX_V2_2026-07-24
+# Fix: preserve Rich training progress through util-linux script pseudo-TTY.
 #
 # Train + render tuần tự toàn bộ scene của VAI_NVS_DATA_ROUND_2.
 #
@@ -117,8 +119,12 @@ SKIP_COMPLETED_TRAIN="${SKIP_COMPLETED_TRAIN:-true}"
 SKIP_COMPLETED_RENDER="${SKIP_COMPLETED_RENDER:-true}"
 STOP_ON_ERROR="${STOP_ON_ERROR:-true}"
 
-# Hai script con đã tự tạo log riêng. Tắt PTY lồng nhau để wrapper hoạt động ổn
-# định cả khi chạy trực tiếp, tmux, nohup hoặc redirect output.
+# Script train dùng Rich progress bar, vì vậy stdout phải là một TTY thật.
+# Wrapper sẽ tự chạy lại bên trong util-linux `script` để vừa giữ progress
+# trực tiếp trên terminal, vừa ghi toàn bộ phiên làm việc vào BATCH_LOG.
+BATCH_USE_PTY_LOGGING="${BATCH_USE_PTY_LOGGING:-true}"
+
+# Không cần tạo PTY lồng thêm trong từng script con vì wrapper đã cung cấp TTY.
 CHILD_USE_PTY_LOGGING="${CHILD_USE_PTY_LOGGING:-false}"
 
 # =============================================================================
@@ -126,12 +132,30 @@ CHILD_USE_PTY_LOGGING="${CHILD_USE_PTY_LOGGING:-false}"
 # =============================================================================
 
 mkdir -p "$OUT_ROOT" "$LOG_ROOT"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="${BATCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 BATCH_LOG="$LOG_ROOT/train_render_all_${TIMESTAMP}.log"
 SUMMARY_FILE="$LOG_ROOT/train_render_all_${TIMESTAMP}.tsv"
 CURRENT_SCENE="not-started"
 
-exec > >(tee -a "$BATCH_LOG") 2>&1
+# Preserve Rich/tqdm live progress while still recording a complete terminal log.
+# `script` allocates a pseudo-terminal, unlike `tee`, which converts stdout to
+# a pipe and causes Rich to disable its live progress display.
+if [[ "$BATCH_USE_PTY_LOGGING" == "true" \
+   && -z "${_3DGRUT_BATCH_PTY_ACTIVE:-}" \
+   && -t 1 \
+   && -x "$(command -v script 2>/dev/null || true)" ]]; then
+    export _3DGRUT_BATCH_PTY_ACTIVE=1
+    export BATCH_TIMESTAMP="$TIMESTAMP"
+    printf -v _BATCH_REEXEC_COMMAND '%q ' bash "$0" "$@"
+    exec script -q -f -e -c "$_BATCH_REEXEC_COMMAND" "$BATCH_LOG"
+fi
+
+# Non-interactive fallback for nohup/CI/redirection. Logs are still written,
+# but a dynamically updating progress bar cannot be displayed without a TTY.
+if [[ -z "${_3DGRUT_BATCH_PTY_ACTIVE:-}" ]]; then
+    exec > >(tee -a "$BATCH_LOG") 2>&1
+fi
+
 printf 'scene\ttrain_status\trender_status\tcheckpoint\trender_dir\n' > "$SUMMARY_FILE"
 
 on_error() {
