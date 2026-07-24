@@ -38,7 +38,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2026-07-24-v3-ifs-python-fix"
+SCRIPT_VERSION="2026-07-24-v5-cuda124-ceil-div-compat"
 
 on_error() {
     local exit_code=$?
@@ -93,9 +93,29 @@ INSTALL_GSPLAT="${INSTALL_GSPLAT:-auto}"
 TORCH_PACKAGES="${TORCH_PACKAGES:-torch==2.9.1 torchvision==0.24.1}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
 
-MAX_JOBS="${MAX_JOBS:-8}"
+# CUDA compilation is memory-heavy. One job is slow but much safer than -j8.
+MAX_JOBS="${MAX_JOBS:-1}"
+
+# simple_trainer.py uses the main gsplat extension. The optional experimental
+# inference extension is not required by this Round-2 pipeline.
+BUILD_EXPERIMENTAL="${BUILD_EXPERIMENTAL:-0}"
+BUILD_NO_CUDA="${BUILD_NO_CUDA:-0}"
+
+# Leave empty for automatic detection from the selected GPU.
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-}"
+
 FORCE_GSPLAT_REBUILD="${FORCE_GSPLAT_REBUILD:-0}"
 PATCH_GSPLAT_RUN_SUB_COMPAT="${PATCH_GSPLAT_RUN_SUB_COMPAT:-1}"
+
+# gsplat main currently uses cuda::ceil_div, which is provided by CCCL 2.7 /
+# CUDA Toolkit 12.8. In auto mode, replace those calls with an equivalent
+# local helper only when the selected nvcc is older than CUDA 12.8.
+#
+# Allowed values:
+#   auto -> patch only for nvcc < 12.8
+#   1    -> always apply the compatibility patch
+#   0    -> never patch; require CUDA Toolkit 12.8+
+PATCH_CUDA_CEIL_DIV_COMPAT="${PATCH_CUDA_CEIL_DIV_COMPAT:-auto}"
 GSPLAT_BUILD_MARKER="${GSPLAT_BUILD_MARKER:-}"
 
 # Preserve explicit empty values for two-machine splitting.
@@ -617,6 +637,180 @@ print(f"[Patch] Backup: {backup}")
 PY_PATCH_GSPLAT
 }
 
+patch_gsplat_cuda_ceil_div_compat() {
+    local nvcc_release=""
+    local nvcc_major=0
+    local nvcc_minor=0
+    local should_patch=0
+
+    nvcc_release="$(
+        "$CUDA_HOME/bin/nvcc" --version \
+        | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
+        | head -n 1
+    )"
+
+    [[ -n "$nvcc_release" ]] || die \
+        "Could not determine CUDA Toolkit version from $CUDA_HOME/bin/nvcc"
+
+    IFS='.' read -r nvcc_major nvcc_minor _ <<< "$nvcc_release"
+    nvcc_major="${nvcc_major:-0}"
+    nvcc_minor="${nvcc_minor:-0}"
+
+    case "$PATCH_CUDA_CEIL_DIV_COMPAT" in
+        1|true|yes|on)
+            should_patch=1
+            ;;
+        0|false|no|off)
+            should_patch=0
+            ;;
+        auto)
+            if (( nvcc_major < 12 )) \
+               || (( nvcc_major == 12 && nvcc_minor < 8 ))
+            then
+                should_patch=1
+            fi
+            ;;
+        *)
+            die \
+                "PATCH_CUDA_CEIL_DIV_COMPAT must be auto, 1/true, or 0/false."
+            ;;
+    esac
+
+    if (( should_patch == 0 )); then
+        echo "[Patch] cuda::ceil_div compatibility not required for CUDA $nvcc_release."
+        return
+    fi
+
+    echo "[Patch] CUDA $nvcc_release is older than 12.8."
+    echo "[Patch] Replacing cuda::ceil_div with a local overflow-safe helper."
+
+    "$PYTHON_BIN" - "$GSPLAT_DIR" <<'PY_PATCH_CEIL_DIV'
+from __future__ import annotations
+
+import re
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+cuda_root = root / "gsplat" / "cuda"
+include_root = cuda_root / "include"
+header = include_root / "CudaCeilDivCompat.cuh"
+marker = "BEGIN GSPLAT CUDA CEIL_DIV COMPAT PATCH"
+
+if not cuda_root.is_dir():
+    raise SystemExit(f"gsplat CUDA source directory is missing: {cuda_root}")
+
+include_root.mkdir(parents=True, exist_ok=True)
+
+header_content = r'''#pragma once
+
+// BEGIN GSPLAT CUDA CEIL_DIV COMPAT PATCH
+//
+// cuda::ceil_div is available only in newer CCCL/CUDA toolkits. This helper is
+// equivalent for the non-negative grid and element counts used by gsplat.
+// The quotient+remainder form avoids the overflow risk of (n + d - 1) / d.
+
+namespace gsplat
+{
+
+template<typename T, typename U>
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+constexpr T ceil_div_compat(T numerator, U denominator)
+{
+    const T divisor = static_cast<T>(denominator);
+    return static_cast<T>(
+        numerator / divisor
+        + static_cast<T>((numerator % divisor) != 0)
+    );
+}
+
+} // namespace gsplat
+
+// END GSPLAT CUDA CEIL_DIV COMPAT PATCH
+'''
+
+if header.exists():
+    existing = header.read_text(encoding="utf-8")
+    if marker not in existing:
+        backup = header.with_name(header.name + ".pre_ceil_div_compat.bak")
+        if not backup.exists():
+            shutil.copy2(header, backup)
+        header.write_text(header_content, encoding="utf-8")
+else:
+    header.write_text(header_content, encoding="utf-8")
+
+extensions = {".cu", ".cuh", ".cpp", ".cc", ".h", ".hpp"}
+targets: list[Path] = []
+
+for path in sorted((cuda_root / "csrc").rglob("*")):
+    if not path.is_file() or path.suffix not in extensions:
+        continue
+    source = path.read_text(encoding="utf-8")
+    if "::cuda::ceil_div" in source:
+        targets.append(path)
+
+if not targets:
+    print("[Patch] No ::cuda::ceil_div calls remain; source is already compatible.")
+    print(f"[Patch] Compatibility header: {header}")
+    raise SystemExit(0)
+
+total_replacements = 0
+
+for path in targets:
+    source = path.read_text(encoding="utf-8")
+    backup = path.with_name(path.name + ".pre_cuda_ceil_div_compat.bak")
+
+    if not backup.exists():
+        shutil.copy2(path, backup)
+
+    if '#include "CudaCeilDivCompat.cuh"' not in source:
+        include_matches = list(
+            re.finditer(r"^#include[^\n]*\n", source, flags=re.MULTILINE)
+        )
+        if not include_matches:
+            raise RuntimeError(f"Could not locate include block in: {path}")
+
+        insert_at = include_matches[-1].end()
+        source = (
+            source[:insert_at]
+            + '#include "CudaCeilDivCompat.cuh"\n'
+            + source[insert_at:]
+        )
+
+    count = source.count("::cuda::ceil_div")
+    source = source.replace(
+        "::cuda::ceil_div",
+        "::gsplat::ceil_div_compat",
+    )
+    path.write_text(source, encoding="utf-8")
+    total_replacements += count
+    print(f"[Patch] {path.relative_to(root)}: replaced {count} call(s)")
+
+remaining = []
+for path in sorted((cuda_root / "csrc").rglob("*")):
+    if not path.is_file() or path.suffix not in extensions:
+        continue
+    if "::cuda::ceil_div" in path.read_text(encoding="utf-8"):
+        remaining.append(str(path.relative_to(root)))
+
+if remaining:
+    raise RuntimeError(
+        "cuda::ceil_div calls remain after patch:\n  - "
+        + "\n  - ".join(remaining)
+    )
+
+if total_replacements <= 0:
+    raise RuntimeError("Compatibility patch did not replace any calls.")
+
+print(f"[Patch] Compatibility header: {header}")
+print(f"[Patch] Total replacements: {total_replacements}")
+print(f"[Patch] Patched source files: {len(targets)}")
+PY_PATCH_CEIL_DIV
+}
+
 install_torch_if_missing() {
     if "$PY" -c "import torch, torchvision" >/dev/null 2>&1; then
         echo "[Python] Existing PyTorch installation detected."
@@ -640,10 +834,97 @@ install_torch_if_missing() {
     fi
 }
 
+configure_gsplat_cuda_build() {
+    local torch_cuda=""
+    local torch_version=""
+    local capability=""
+    local nvcc_release=""
+
+    torch_version="$(
+        "$PY" -c 'import torch; print(torch.__version__)'
+    )"
+    torch_cuda="$(
+        "$PY" -c 'import torch; print(torch.version.cuda or "none")'
+    )"
+    capability="$(
+        "$PY" -c \
+            'import torch; m, n = torch.cuda.get_device_capability(0); print(f"{m}.{n}")'
+    )"
+    nvcc_release="$(
+        "$CUDA_HOME/bin/nvcc" --version \
+        | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' \
+        | head -n 1
+    )"
+
+    if [[ -z "$TORCH_CUDA_ARCH_LIST" ]]; then
+        TORCH_CUDA_ARCH_LIST="$capability"
+    fi
+
+    export TORCH_CUDA_ARCH_LIST
+    export BUILD_EXPERIMENTAL
+    export BUILD_NO_CUDA
+    export MAX_JOBS
+
+    echo "[Build] PyTorch             : $torch_version"
+    echo "[Build] PyTorch CUDA       : $torch_cuda"
+    echo "[Build] Local nvcc CUDA    : ${nvcc_release:-unknown}"
+    echo "[Build] CUDA architecture  : $TORCH_CUDA_ARCH_LIST"
+    echo "[Build] MAX_JOBS           : $MAX_JOBS"
+    echo "[Build] BUILD_EXPERIMENTAL : $BUILD_EXPERIMENTAL"
+    echo "[Build] BUILD_NO_CUDA      : $BUILD_NO_CUDA"
+
+    if [[ "$torch_cuda" != "none" \
+       && -n "$nvcc_release" \
+       && "$torch_cuda" != "$nvcc_release" ]]
+    then
+        echo "WARNING: PyTorch CUDA ($torch_cuda) and local nvcc ($nvcc_release) differ."
+        echo "WARNING: The ceil_div source incompatibility is patched for CUDA <12.8,"
+        echo "WARNING: but installing a matching CUDA 12.8 toolkit remains the cleanest setup."
+    fi
+}
+
+run_gsplat_editable_build() {
+    local build_log="$1"
+    local rc=0
+
+    mkdir -p "$(dirname "$build_log")"
+
+    echo "[Build] Full log: $build_log"
+
+    set +e
+    (
+        cd "$GSPLAT_DIR"
+        BUILD_EXPERIMENTAL="$BUILD_EXPERIMENTAL" \
+        BUILD_NO_CUDA="$BUILD_NO_CUDA" \
+        MAX_JOBS="$MAX_JOBS" \
+        TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+        "$PY" -m pip install \
+            --no-build-isolation \
+            --config-settings editable_mode=compat \
+            -e .
+    ) 2>&1 | tee "$build_log"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    if (( rc != 0 )); then
+        echo
+        echo "================ FIRST RELEVANT BUILD ERRORS ================"
+        grep -nEi \
+            'error:|fatal error|nvcc fatal|unsupported|killed|out of memory|internal compiler|FAILED:|subcommand failed|mismatch' \
+            "$build_log" \
+            | head -n 80 \
+            || true
+        echo "============================================================="
+        echo "Build failed. Full log: $build_log"
+        return "$rc"
+    fi
+}
+
 install_gsplat_source() {
     local should_install=0
     local current_revision=""
     local marker_revision=""
+    local build_log=""
 
     current_revision="$(git -C "$GSPLAT_DIR" rev-parse HEAD)"
 
@@ -687,32 +968,25 @@ install_gsplat_source() {
     "$PY" -m pip install --upgrade pip setuptools wheel ninja packaging
 
     install_torch_if_missing
+    configure_gsplat_cuda_build
 
-    # Build/install the CUDA extension from the cloned source.
-    (
-        cd "$GSPLAT_DIR"
-        MAX_JOBS="$MAX_JOBS" \
-        "$PY" -m pip install \
-            --no-build-isolation \
-            --config-settings editable_mode=compat \
-            -e .
-    )
-
-    # Install the exact dependencies required by simple_trainer.py, render and
-    # PPISP/bilateral-grid support. PyTorch is installed first intentionally.
+    # Install trainer/render dependencies before building gsplat. PyTorch and
+    # torchvision are already pinned, so pip should keep the selected pair.
     "$PY" -m pip install \
         --no-build-isolation \
         -r "$GSPLAT_DIR/examples/requirements.txt"
 
-    # Reinstall editable source last in case dependency resolution changed it.
-    (
-        cd "$GSPLAT_DIR"
-        MAX_JOBS="$MAX_JOBS" \
-        "$PY" -m pip install \
-            --no-build-isolation \
-            --config-settings editable_mode=compat \
-            -e .
-    )
+    # requirements.txt may install additional CUDA extensions. Re-check the
+    # effective torch/toolkit settings before compiling gsplat itself.
+    configure_gsplat_cuda_build
+
+    build_log="$PROJECT_DIR/logs/r2_setup/gsplat_build_$(date +%Y%m%d_%H%M%S).log"
+
+    if ! run_gsplat_editable_build "$build_log"; then
+        die \
+            "gsplat CUDA build failed. Retry with MAX_JOBS=1 and inspect: " \
+            "$build_log"
+    fi
 
     printf '%s\n' "$current_revision" > "$GSPLAT_BUILD_MARKER"
     echo "[Python] gsplat install marker: $GSPLAT_BUILD_MARKER"
@@ -1235,6 +1509,10 @@ echo "gsplat ref            : $GSPLAT_REF"
 echo "gsplat directory      : $GSPLAT_DIR"
 echo "Install gsplat        : $INSTALL_GSPLAT"
 echo "Patch run_sub compat  : $PATCH_GSPLAT_RUN_SUB_COMPAT"
+echo "Patch CUDA ceil_div   : $PATCH_CUDA_CEIL_DIV_COMPAT"
+echo "Build jobs            : $MAX_JOBS"
+echo "Build experimental    : $BUILD_EXPERIMENTAL"
+echo "CUDA arch override    : ${TORCH_CUDA_ARCH_LIST:-auto}"
 echo "Torch packages        : $TORCH_PACKAGES"
 echo "Python requested      : ${PYTHON_BIN:-auto}"
 echo "Python supported      : 3.${PYTHON_MIN_MINOR}–3.${PYTHON_MAX_MINOR}"
@@ -1266,6 +1544,7 @@ setup_cuda_toolkit
 clone_or_prepare_gsplat
 prepare_project_gsplat_link
 patch_gsplat_run_sub_compat
+patch_gsplat_cuda_ceil_div_compat
 setup_python_environment
 prepare_r2_alias
 
